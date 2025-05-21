@@ -51,7 +51,13 @@ from lerobot.common.utils.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts.eval import eval_policy
-
+import sys
+import os
+# ルートディレクトリを追加
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+print(f"Root directory: {root_dir}")
+sys.path.append(root_dir)
+import env
 
 def update_policy(
     train_metrics: MetricsTracker,
