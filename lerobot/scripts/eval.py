@@ -307,17 +307,16 @@ def eval_policy(
         # this won't be included).
         n_steps = rollout_data["done"].shape[1]
         # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
-        done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
-
+        done_indices = torch.argmax(rollout_data["done"].to(int), dim=1).cpu()
         # Make a mask with shape (batch, n_steps) to mask out rollout data after the first done
         # (batch-element-wise). Note the `done_indices + 1` to make sure to keep the data from the done step.
-        mask = (torch.arange(n_steps) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
+        mask = (torch.arange(n_steps, device=done_indices.device) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
         # Extend metrics.
         batch_sum_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "sum")
         sum_rewards.extend(batch_sum_rewards.tolist())
         batch_max_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "max")
         max_rewards.extend(batch_max_rewards.tolist())
-        batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
+        batch_successes = einops.reduce((rollout_data["success"].cpu() * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
         if seeds:
             all_seeds.extend(seeds)
