@@ -69,6 +69,15 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     # TODO(rcadene): enable pixels only baseline with `obs_type="pixels"` in environment by removing
     # requirement for "agent_pos"
     return_observations["observation.state"] = torch.from_numpy(observations["agent_pos"]).float()
+    img = torch.from_numpy(observations["observation.images.front"])
+    img = einops.rearrange(img, "b h w c -> b c h w").contiguous()
+    return_observations["observation.images.front"] = img.type(torch.float32)/255
+    img = torch.from_numpy(observations["observation.images.side"])
+    img = einops.rearrange(img, "b h w c -> b c h w").contiguous()
+    return_observations["observation.images.side"] = img.type(torch.float32)/255
+    img = torch.from_numpy(observations["observation.images.sound"])
+    img = einops.rearrange(img, "b h w c -> b c h w").contiguous()
+    return_observations["observation.images.sound"] = img.type(torch.float32)/255
     return return_observations
 
 

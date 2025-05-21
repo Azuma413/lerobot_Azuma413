@@ -58,6 +58,7 @@ root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 print(f"Root directory: {root_dir}")
 sys.path.append(root_dir)
 import env
+import torch.multiprocessing as mp
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -170,22 +171,31 @@ def train(cfg: TrainPipelineConfig):
 
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        sampler = EpisodeAwareSampler(
+        # EpisodeAwareSampler handles its own shuffling logic if configured.
+        # DataLoader's shuffle parameter should be False as we are providing a sampler.
+        dl_sampler = EpisodeAwareSampler(
             dataset.episode_data_index,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
+            shuffle=True,  # This shuffle is for the EpisodeAwareSampler itself
         )
+        dl_shuffle = False
     else:
-        shuffle = True
-        sampler = None
+        # Original code had shuffle=True and sampler=None.
+        # This combination makes DataLoader use an internal RandomSampler,
+        # which by default creates a CPU-based torch.Generator, leading to the RuntimeError on CUDA.
+        # Solution: Explicitly create a RandomSampler with a generator on the correct device.
+        generator_for_sampler = torch.Generator(device=device)
+        if cfg.seed is not None:
+            generator_for_sampler.manual_seed(cfg.seed)
+        dl_sampler = torch.utils.data.RandomSampler(dataset, generator=generator_for_sampler)
+        dl_shuffle = False # Must be False when a sampler is provided
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
+        shuffle=dl_shuffle,
+        sampler=dl_sampler,
         pin_memory=device.type != "cpu",
         drop_last=False,
     )
@@ -290,5 +300,10 @@ def train(cfg: TrainPipelineConfig):
 
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError as e:
+        logging.warning(f"Could not set multiprocessing start method to 'spawn': {e}")
+        logging.warning("This might lead to issues if using CUDA with DataLoader and num_workers > 0.")
     init_logging()
     train()
