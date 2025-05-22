@@ -273,7 +273,7 @@ def train(cfg: TrainPipelineConfig):
                     policy,
                     cfg.eval.n_episodes,
                     videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                    max_episodes_rendered=4,
+                    max_episodes_rendered=1,
                     start_seed=cfg.seed,
                 )
 

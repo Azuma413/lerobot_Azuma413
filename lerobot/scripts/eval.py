@@ -343,7 +343,16 @@ def eval_policy(
 
         # Maybe render video for visualization.
         if max_episodes_rendered > 0 and len(ep_frames) > 0:
-            batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
+            print("save video")
+            # ep_frames: List[(b, h, w, c)] × t → (t, b, h, w, c)
+            first_shape = ep_frames[0].shape
+            print(f"ep_frames[0].shape: {first_shape}")
+            if len(first_shape) == 3:
+                # If the first frame is a single image, we need to add a batch dimension.
+                ep_frames = [np.expand_dims(frame, axis=0) for frame in ep_frames]
+            batch_stacked_frames = np.stack(ep_frames, axis=0)  # (t, b, h, w, c)
+            # 軸を (b, t, h, w, c) に変換
+            batch_stacked_frames = batch_stacked_frames.transpose(1, 0, 2, 3, 4)  # (b, t, h, w, c)
             for stacked_frames, done_index in zip(
                 batch_stacked_frames, done_indices.flatten().tolist(), strict=False
             ):
@@ -357,13 +366,15 @@ def eval_policy(
                     target=write_video,
                     args=(
                         str(video_path),
-                        stacked_frames[: done_index + 1],  # + 1 to capture the last observation
+                        stacked_frames[: done_index + 1],  # (t, h, w, c)
                         env.unwrapped.metadata["render_fps"],
                     ),
                 )
                 thread.start()
                 threads.append(thread)
                 n_episodes_rendered += 1
+        else:
+            print("no video")
 
         progbar.set_postfix(
             {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
