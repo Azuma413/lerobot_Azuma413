@@ -24,6 +24,19 @@ class CameraConfig(draccus.ChoiceRegistry, abc.ABC):
     def type(self) -> str:
         return self.get_choice_name(self.__class__)
 
+@CameraConfig.register_subclass("sound")
+@dataclass
+class SoundCameraConfig(CameraConfig):
+    camera_index: int
+    fps: int | None = None
+    width: int | None = None
+    height: int | None = None
+    color_mode: str = "rgb"
+    channels: int | None = None
+    rotation: int | None = None
+    mock: bool = False
+    def __post_init__(self):
+        self.channels = 3
 
 @CameraConfig.register_subclass("opencv")
 @dataclass

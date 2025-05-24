@@ -22,6 +22,7 @@ from lerobot.common.robot_devices.cameras.configs import (
     CameraConfig,
     IntelRealSenseCameraConfig,
     OpenCVCameraConfig,
+    SoundCameraConfig,
 )
 from lerobot.common.robot_devices.motors.configs import (
     DynamixelMotorsBusConfig,
@@ -536,18 +537,24 @@ class So100RobotConfig(ManipulatorRobotConfig):
 
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
-            "laptop": OpenCVCameraConfig(
+            "webcam": OpenCVCameraConfig(
                 camera_index=0,
                 fps=30,
                 width=640,
                 height=480,
             ),
-            "phone": OpenCVCameraConfig(
+            "realsense": OpenCVCameraConfig(
                 camera_index=1,
                 fps=30,
                 width=640,
                 height=480,
             ),
+            "sound": SoundCameraConfig(
+                camera_index=0,
+                fps=30,
+                width=640,
+                height=480,
+            )
         }
     )
 
