@@ -184,7 +184,8 @@ def train(cfg: TrainPipelineConfig):
         # This combination makes DataLoader use an internal RandomSampler,
         # which by default creates a CPU-based torch.Generator, leading to the RuntimeError on CUDA.
         # Solution: Explicitly create a RandomSampler with a generator on the correct device.
-        generator_for_sampler = torch.Generator(device=device)
+        generator_for_sampler = torch.Generator()
+        # generator_for_sampler = torch.Generator(device=device)
         if cfg.seed is not None:
             generator_for_sampler.manual_seed(cfg.seed)
         dl_sampler = torch.utils.data.RandomSampler(dataset, generator=generator_for_sampler)
