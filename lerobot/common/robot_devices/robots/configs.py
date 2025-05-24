@@ -550,7 +550,9 @@ class So100RobotConfig(ManipulatorRobotConfig):
                 height=480,
             ),
             "sound": SoundCameraConfig(
-                camera_index=0,
+                top_mic_idx=4,
+                right_mic_idx=6,
+                left_mic_idx=5,
                 fps=30,
                 width=640,
                 height=480,

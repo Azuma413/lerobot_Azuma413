@@ -27,7 +27,9 @@ class CameraConfig(draccus.ChoiceRegistry, abc.ABC):
 @CameraConfig.register_subclass("sound")
 @dataclass
 class SoundCameraConfig(CameraConfig):
-    camera_index: int
+    top_mic_idx: int
+    right_mic_idx: int
+    left_mic_idx: int
     fps: int | None = None
     width: int | None = None
     height: int | None = None
