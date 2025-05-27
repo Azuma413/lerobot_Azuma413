@@ -36,6 +36,7 @@ from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.utils import get_safe_torch_device, has_method
+from lerobot.common.robot_devices.sound_utils import SoundController
 
 
 def log_control_info(robot: Robot, dt_s, episode_index=None, frame_index=None, fps=None):
@@ -196,6 +197,7 @@ def record_episode(
     policy,
     fps,
     single_task,
+    sound_volume=None
 ):
     control_loop(
         robot=robot,
@@ -207,6 +209,7 @@ def record_episode(
         fps=fps,
         teleoperate=policy is None,
         single_task=single_task,
+        sound_volume=sound_volume
     )
 
 
@@ -221,6 +224,7 @@ def control_loop(
     policy: PreTrainedPolicy = None,
     fps: int | None = None,
     single_task: str | None = None,
+    sound_volume=None
 ):
     # TODO(rcadene): Add option to record logs
     if not robot.is_connected:
@@ -240,7 +244,13 @@ def control_loop(
 
     if dataset is not None and fps is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset['fps']} != {fps}).")
-
+    # sound_volumeは[0.5, 0.5]のようなfloatのlistで送られてくる
+    sound_controller = None
+    if sound_volume is not None:
+        if not isinstance(sound_volume, list) or len(sound_volume) != 2:
+            raise ValueError("sound_volume should be a list of two floats representing left and right volumes.")
+        sound_controller = SoundController(left_volume=sound_volume[0], right_volume=sound_volume[1])
+        sound_controller.play_noise()
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
@@ -287,6 +297,8 @@ def control_loop(
         if events["exit_early"]:
             events["exit_early"] = False
             break
+    if sound_controller is not None:
+        sound_controller.stop_noise()
 
 
 def reset_environment(robot, events, reset_time_s, fps):

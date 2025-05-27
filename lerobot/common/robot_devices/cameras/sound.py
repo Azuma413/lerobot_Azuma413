@@ -16,6 +16,7 @@ from lerobot.common.robot_devices.utils import (
     RobotDeviceNotConnectedError,
     busy_wait,
 )
+from lerobot.common.utils.utils import capture_timestamp_utc
 
 def save_image(img_array, frame_index, images_dir):
     img = Image.fromarray(img_array)
@@ -109,6 +110,9 @@ class SoundCamera:
         self.mock = config.mock
         self.is_connected = False
 
+        # ログ記録用
+        self.logs = {}
+
         # 録音用パラメータ
         self.fs = 16000
         self.record_seconds = 0.1  # 0.1秒録音
@@ -137,12 +141,24 @@ class SoundCamera:
         if not self.is_connected:
             raise RobotDeviceNotConnectedError("SoundCameraはconnect()されていません。")
 
+        start_time = time.perf_counter()
+
         # mockモードの場合はランダム画像を返す
         if self.mock:
             img = np.random.randint(0, 256, (self.height, self.width, 3), dtype=np.uint8)
+            # ログ記録
+            self.logs["delta_timestamp_s"] = time.perf_counter() - start_time
+            self.logs["timestamp_utc"] = capture_timestamp_utc()
             return img
 
         # 3つのマイクデバイスで独立にDOA推定し、RGB画像化（env/tasks/sound.py参照）
+        # 画像上で三角形状にマイクアレイ中心を配置する
+        mic_positions_image = [
+            # 画像上で三角形になるような座標（env/tasks/sound.pyを参考に）
+            [int(self.height * 0.0), int(self.width * 0.5)],  # 上（例: top）
+            [int(self.height * 1.0), int(self.width * 0.125)], # 左下（例: left）
+            [int(self.height * 1.0), int(self.width * 0.875)], # 右下（例: right）
+        ]
         sound_maps = []
         for mic_idx, dev in enumerate(self.device_paths):
             try:
@@ -157,7 +173,7 @@ class SoundCamera:
                 # 8chマイクアレイ仮定
                 data = rec.T  # shape: (8, サンプル数)
                 # マイク座標（円形配置、z=0.1m）
-                mic_locs = pra.circular_2D_array(center=[0, 0], M=8, phi0=0, radius=0.035)
+                mic_locs = pra.circular_2D_array(center=[0, 0], M=8, phi0=0, radius=0.065)
                 mic_positions = np.vstack([mic_locs, np.ones((1, 8)) * 0.1])  # shape: (3, 8)
                 # STFT
                 X = pra.transform.stft.analysis(data.T, self.nfft, self.nfft // 2)
@@ -169,12 +185,14 @@ class SoundCamera:
                 spatial_resp = doa.grid.values
                 # 0-1正規化
                 spatial_resp = (spatial_resp - spatial_resp.min()) / (spatial_resp.max() - spatial_resp.min() + 1e-8)
+                spatial_resp = spatial_resp**6
             except Exception as e:
                 spatial_resp = np.zeros(360)
 
             # 画像化
-            # マイクアレイ中心を画像中央にマッピング
-            mic_coord = [self.height // 2, self.width // 2]
+            # マイクアレイ中心を三角形状にマッピング
+            # mic_coord = [self.height // 2, self.width // 2]
+            mic_coord = mic_positions_image[mic_idx]
             y_idx, x_idx = np.indices((self.height, self.width))
             angles = (np.arctan2(y_idx - mic_coord[0], x_idx - mic_coord[1]) * 180 / np.pi + 90) % 360
             angles_idx = angles.astype(int)
@@ -189,6 +207,11 @@ class SoundCamera:
         sound_image_array = np.transpose(sound_image_array, (1, 2, 0))
         # 0-255にスケーリング＆uint8化
         sound_image_array = np.clip(sound_image_array * 255, 0, 255).astype(np.uint8)
+
+        # ログ記録
+        self.logs["delta_timestamp_s"] = time.perf_counter() - start_time
+        self.logs["timestamp_utc"] = capture_timestamp_utc()
+
         return sound_image_array
 
     def read_loop(self):

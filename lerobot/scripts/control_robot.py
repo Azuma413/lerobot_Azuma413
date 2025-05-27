@@ -170,6 +170,7 @@ from lerobot.common.robot_devices.robots.utils import Robot, make_robot_from_con
 from lerobot.common.robot_devices.utils import busy_wait, safe_disconnect
 from lerobot.common.utils.utils import has_method, init_logging, log_say
 from lerobot.configs import parser
+import numpy as np
 
 ########################################################################################
 # Control modes
@@ -289,6 +290,16 @@ def record(
 
     if has_method(robot, "teleop_safety_stop"):
         robot.teleop_safety_stop()
+    
+    sound_volume = None
+    # もしcfg.repo_idに"sound"が含まれていたら
+    if "sound" in cfg.repo_id:
+        # 0-1の乱数を生成
+        random_value = np.random.rand()
+        if random_value < 0.5:
+            sound_volume = [0.0, 1.0]
+        else:
+            sound_volume = [1.0, 0.0]
 
     recorded_episodes = 0
     while True:
@@ -305,6 +316,7 @@ def record(
             policy=policy,
             fps=cfg.fps,
             single_task=cfg.single_task,
+            sound_volume=sound_volume,
         )
 
         # Execute a few seconds without recording to give time to manually reset the environment
