@@ -292,21 +292,24 @@ def record(
         robot.teleop_safety_stop()
     
     sound_volume = None
-    # もしcfg.repo_idに"sound"が含まれていたら
-    if "sound" in cfg.repo_id:
-        # 0-1の乱数を生成
-        random_value = np.random.rand()
-        if random_value < 0.5:
-            sound_volume = [0.0, 1.0]
-        else:
-            sound_volume = [1.0, 0.0]
 
     recorded_episodes = 0
     while True:
         if recorded_episodes >= cfg.num_episodes:
             break
-
-        log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+        # もしcfg.repo_idに"sound"が含まれていたら
+        if "sound" in cfg.repo_id:
+            # 0-1の乱数を生成
+            random_value = np.random.rand()
+            if random_value < 0.5:
+                sound_volume = [0.0, 1.0]
+                log_say(f"Recording episode {dataset.num_episodes} right", cfg.play_sounds)
+            else:
+                sound_volume = [1.0, 0.0]
+                log_say(f"Recording episode {dataset.num_episodes} left", cfg.play_sounds)
+        else:
+            log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+        
         record_episode(
             robot=robot,
             dataset=dataset,
