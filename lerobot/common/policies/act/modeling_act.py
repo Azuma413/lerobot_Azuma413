@@ -341,6 +341,39 @@ class ACT(nn.Module):
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+        if "sound_map" in self.config.input_features:
+            channel_size = self.config.input_features["sound_map"].shape[0]
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                weights=config.pretrained_backbone_weights,
+                norm_layer=FrozenBatchNorm2d,
+            )
+            original_conv1 = backbone_model.conv1
+            backbone_model.conv1 = nn.Conv2d(
+                in_channels=channel_size,
+                out_channels=original_conv1.out_channels,
+                kernel_size=original_conv1.kernel_size,
+                stride=original_conv1.stride,
+                padding=original_conv1.padding,
+                bias=original_conv1.bias is not None,
+            )
+            self.sound_map_backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+        if "spectrogram" in self.config.input_features:
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                weights=config.pretrained_backbone_weights,
+                norm_layer=FrozenBatchNorm2d,
+            )
+            original_conv1 = backbone_model.conv1
+            backbone_model.conv1 = nn.Conv2d(
+                in_channels=1,
+                out_channels=original_conv1.out_channels,
+                kernel_size=original_conv1.kernel_size,
+                stride=original_conv1.stride,
+                padding=original_conv1.padding,
+                bias=original_conv1.bias is not None,
+            )
+            self.spectrogram_backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -488,9 +521,14 @@ class ACT(nn.Module):
 
             # For a list of images, the H and W may vary but H*W is constant.
             for img in batch["observation.images"]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                if img.shape[1] == 3:
+                    cam_features = self.backbone(img)["feature_map"] # 画像特徴量を抽出
+                elif img.shape[1] == 1:
+                    cam_features = self.spectrogram_backbone(img)["feature_map"]
+                else:
+                    cam_features = self.sound_map_backbone(img)["feature_map"]
+                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype) # 位置エンベディングを計算
+                cam_features = self.encoder_img_feat_input_proj(cam_features) # 特徴量をTransformerの入力次元に変換
 
                 # Rearrange features to (sequence, batch, dim).
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
