@@ -1,4 +1,6 @@
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,13 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import random
 
 import numpy as np
 import pytest
 import torch
 
-from lerobot.common.utils.random_utils import (
+from lerobot.utils.random_utils import (
     deserialize_numpy_rng_state,
     deserialize_python_rng_state,
     deserialize_rng_state,

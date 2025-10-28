@@ -19,9 +19,8 @@ import traceback
 import pytest
 from serial import SerialException
 
-from lerobot import available_cameras, available_motors, available_robots
-from lerobot.common.robot_devices.robots.utils import make_robot
-from tests.utils import DEVICE, make_camera, make_motors_bus
+from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
+from tests.utils import DEVICE
 
 # Import fixture modules as plugins
 pytest_plugins = [
@@ -29,6 +28,7 @@ pytest_plugins = [
     "tests.fixtures.files",
     "tests.fixtures.hub",
     "tests.fixtures.optimizers",
+    "tests.plugins.reachy2_sdk",
 ]
 
 
@@ -65,24 +65,27 @@ def _check_component_availability(component_type, available_components, make_com
 
 
 @pytest.fixture
-def is_robot_available(robot_type):
-    return _check_component_availability(robot_type, available_robots, make_robot)
-
-
-@pytest.fixture
-def is_camera_available(camera_type):
-    return _check_component_availability(camera_type, available_cameras, make_camera)
-
-
-@pytest.fixture
-def is_motor_available(motor_type):
-    return _check_component_availability(motor_type, available_motors, make_motors_bus)
-
-
-@pytest.fixture
 def patch_builtins_input(monkeypatch):
     def print_text(text=None):
         if text is not None:
             print(text)
 
     monkeypatch.setattr("builtins.input", print_text)
+
+
+@pytest.fixture
+def policy_feature_factory():
+    """PolicyFeature factory"""
+
+    def _pf(ft: FeatureType, shape: tuple[int, ...]) -> PolicyFeature:
+        return PolicyFeature(type=ft, shape=shape)
+
+    return _pf
+
+
+def assert_contract_is_typed(features: dict[PipelineFeatureType, dict[str, PolicyFeature]]) -> None:
+    assert isinstance(features, dict)
+    assert all(isinstance(k, PipelineFeatureType) for k in features)
+    assert all(isinstance(v, dict) for v in features.values())
+    assert all(all(isinstance(nk, str) for nk in v) for v in features.values())
+    assert all(all(isinstance(nv, PolicyFeature) for nv in v.values()) for v in features.values())
