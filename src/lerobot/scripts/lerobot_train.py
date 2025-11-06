@@ -141,7 +141,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
     cfg.validate()
-
+    dataset_path = cfg.dataset.root
+    # - で分割
+    name_list = dataset_path.split("-")
+    print(f"name_list: {name_list}")
+    mic_num = int(name_list[1][1:])
+    print(f"mic_num: {mic_num}")
+    cfg.policy.mic_num = mic_num
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes

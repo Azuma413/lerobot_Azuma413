@@ -37,7 +37,6 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -128,6 +127,7 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch["image_keys"] = self.config.image_features
 
         actions = self.model(batch)[0]
         return actions
@@ -137,6 +137,7 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch["image_keys"] = self.config.image_features
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
@@ -320,15 +321,78 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            # Get the base model function
+            base_model_fn = getattr(torchvision.models, config.vision_backbone)
+            
+            # Get the output feature dimension from a dummy instance
+            try:
+                dummy_model = base_model_fn()
+                self.backbone_output_dim = dummy_model.fc.in_features
+                del dummy_model
+            except TypeError:
+                # Handle cases where weights might be required
+                dummy_model = base_model_fn(weights=None)
+                self.backbone_output_dim = dummy_model.fc.in_features
+                del dummy_model
+
+            # Define keys for different processing
+            self.std_image_keys = ["observation.images.front", "observation.images.side"]
+            self.mic_image_keys = ["observation.images.sound0", "observation.images.sound1"]
+            self.spec_image_key = "observation.images.spec"
+            
+            # Standard 3-ch backbone (front, side)
+            if any(key in self.config.image_features for key in self.std_image_keys):
+                backbone_model = base_model_fn(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+                self.encoder_img_feat_input_proj = nn.Conv2d(
+                    self.backbone_output_dim, config.dim_model, kernel_size=1
+                )
+
+            # Mic (sound0, sound1) backbone (mic_num-ch)
+            if any(key in self.config.image_features for key in self.mic_image_keys):
+                mic_backbone_model = base_model_fn(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=None,  # Cannot use pretrained weights for mic_num channels
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # Replace the first conv layer
+                mic_backbone_model.conv1 = nn.Conv2d(
+                    config.mic_num,
+                    mic_backbone_model.conv1.out_channels,
+                    kernel_size=mic_backbone_model.conv1.kernel_size,
+                    stride=mic_backbone_model.conv1.stride,
+                    padding=mic_backbone_model.conv1.padding,
+                    bias=False,
+                )
+                self.mic_backbone = IntermediateLayerGetter(mic_backbone_model, return_layers={"layer4": "feature_map"})
+                self.encoder_mic_feat_input_proj = nn.Conv2d(
+                    self.backbone_output_dim, config.dim_model, kernel_size=1
+                )
+                
+            # Spec (spec) backbone (1-ch)
+            if self.spec_image_key in self.config.image_features:
+                spec_backbone_model = base_model_fn(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=None,  # Cannot use pretrained weights for 1 channel
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # Replace the first conv layer
+                spec_backbone_model.conv1 = nn.Conv2d(
+                    1,  # 1-channel input
+                    spec_backbone_model.conv1.out_channels,
+                    kernel_size=spec_backbone_model.conv1.kernel_size,
+                    stride=spec_backbone_model.conv1.stride,
+                    padding=spec_backbone_model.conv1.padding,
+                    bias=False,
+                )
+                self.spec_backbone = IntermediateLayerGetter(spec_backbone_model, return_layers={"layer4": "feature_map"})
+                self.encoder_spec_feat_input_proj = nn.Conv2d(
+                    self.backbone_output_dim, config.dim_model, kernel_size=1
+                )
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -345,10 +409,6 @@ class ACT(nn.Module):
                 self.config.env_state_feature.shape[0], config.dim_model
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
-        if self.config.image_features:
-            self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
-            )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -468,17 +528,63 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
+            
+            # --- 1. Handle Mic (sound0, sound1) first ---
+            # Convert to list to ensure we can iterate and index properly
+            image_keys_list = list(batch["image_keys"])
+            mic_img_list = []
+            if "observation.images.sound0" in image_keys_list:
+                sound0_idx = image_keys_list.index("observation.images.sound0")
+                mic_img_list.append(batch[OBS_IMAGES][sound0_idx])
+            if "observation.images.sound1" in image_keys_list:
+                sound1_idx = image_keys_list.index("observation.images.sound1")
+                mic_img_list.append(batch[OBS_IMAGES][sound1_idx])
+            
+            if mic_img_list:
+                # Concat along channel dim
+                combined_mic_img = torch.cat(mic_img_list, dim=1)
+                
+                # Slice to mic_num channels
+                mic_input_img = combined_mic_img[:, : self.config.mic_num, :, :]
+                
+                # Process with mic_backbone
+                cam_features = self.mic_backbone(mic_input_img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                cam_features = self.encoder_mic_feat_input_proj(cam_features)
 
-                # Rearrange features to (sequence, batch, dim).
+                # Add to tokens
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                encoder_in_tokens.extend(list(cam_features))
+                encoder_in_pos_embed.extend(list(cam_pos_embed))
 
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
+            # --- 2. Handle other images (front, side, spec) ---
+            # Iterate over the keys and tensors provided by the policy
+            for key, img in zip(image_keys_list, batch[OBS_IMAGES]):
+                
+                # Skip mic images, they were handled above
+                if key in self.mic_image_keys:
+                    continue
+                    
+                # Handle spec
+                elif key == self.spec_image_key:
+                    # Select 1st channel
+                    spec_input_img = img[:, 0:1, :, :]
+                    
+                    cam_features = self.spec_backbone(spec_input_img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_spec_feat_input_proj(cam_features)
+                
+                # Handle front/side (and any other default)
+                else: 
+                    # This covers `front`, `side`, and any other key
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+                
+                # Add to tokens
+                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
 
