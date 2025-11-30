@@ -529,41 +529,43 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             
-            # --- 1. Handle Mic (sound0, sound1) first ---
             # Convert to list to ensure we can iterate and index properly
             image_keys_list = list(batch["image_keys"])
-            mic_img_list = []
-            if "observation.images.sound0" in image_keys_list:
-                sound0_idx = image_keys_list.index("observation.images.sound0")
-                mic_img_list.append(batch[OBS_IMAGES][sound0_idx])
-            if "observation.images.sound1" in image_keys_list:
-                sound1_idx = image_keys_list.index("observation.images.sound1")
-                mic_img_list.append(batch[OBS_IMAGES][sound1_idx])
             
-            if mic_img_list:
-                # Concat along channel dim
-                combined_mic_img = torch.cat(mic_img_list, dim=1)
-                
-                # Slice to mic_num channels
-                mic_input_img = combined_mic_img[:, : self.config.mic_num, :, :]
-                
-                # Process with mic_backbone
-                cam_features = self.mic_backbone(mic_input_img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_mic_feat_input_proj(cam_features)
-
-                # Add to tokens
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
-
-            # --- 2. Handle other images (front, side, spec) ---
-            # Iterate over the keys and tensors provided by the policy
-            for key, img in zip(image_keys_list, batch[OBS_IMAGES]):
-                
-                # Skip mic images, they were handled above
+            # Process images IN ORDER to maintain consistency with training
+            # Collect mic images first if they exist
+            mic_indices = []
+            if "observation.images.sound0" in image_keys_list:
+                mic_indices.append(image_keys_list.index("observation.images.sound0"))
+            if "observation.images.sound1" in image_keys_list:
+                mic_indices.append(image_keys_list.index("observation.images.sound1"))
+            
+            # Process each image in the order specified by image_keys_list
+            for idx, (key, img) in enumerate(zip(image_keys_list, batch[OBS_IMAGES])):
+                # Handle mic images: combine sound0 and sound1 when we encounter the first mic image
                 if key in self.mic_image_keys:
+                    # Only process once when we hit the first mic image index
+                    if idx == min(mic_indices) and len(mic_indices) > 0:
+                        # Collect all mic images
+                        mic_img_list = [batch[OBS_IMAGES][i] for i in sorted(mic_indices)]
+                        
+                        # Concat along channel dim
+                        combined_mic_img = torch.cat(mic_img_list, dim=1)
+                        
+                        # Slice to mic_num channels
+                        mic_input_img = combined_mic_img[:, : self.config.mic_num, :, :]
+                        
+                        # Process with mic_backbone
+                        cam_features = self.mic_backbone(mic_input_img)["feature_map"]
+                        cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                        cam_features = self.encoder_mic_feat_input_proj(cam_features)
+
+                        # Add to tokens
+                        cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                        cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                        encoder_in_tokens.extend(list(cam_features))
+                        encoder_in_pos_embed.extend(list(cam_pos_embed))
+                    # Skip subsequent mic images as they were already processed
                     continue
                     
                 # Handle spec
