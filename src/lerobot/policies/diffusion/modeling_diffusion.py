@@ -84,10 +84,10 @@ class DiffusionPolicy(PreTrainedPolicy):
             OBS_STATE: deque(maxlen=self.config.n_obs_steps),
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        if self.config.image_features:
-            self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        for key in self.config.image_features:
+            self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -126,7 +126,6 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
@@ -141,7 +140,6 @@ class DiffusionPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -168,14 +166,41 @@ class DiffusionModel(nn.Module):
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
         if self.config.image_features:
-            num_images = len(self.config.image_features)
-            if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
-                self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
-            else:
-                self.rgb_encoder = DiffusionRgbEncoder(config)
-                global_cond_dim += self.rgb_encoder.feature_dim * num_images
+            # Define keys for different processing
+            self.std_image_keys = ["observation.images.front", "observation.images.side"]
+            self.mic_image_keys = ["observation.images.sound0", "observation.images.sound1"]
+            self.spec_image_key = "observation.images.spec"
+
+            encoders = {}
+            global_cond_dim_images = 0
+
+            # Standard 3-ch backbone (front, side)
+            if any(key in self.config.image_features for key in self.std_image_keys):
+                encoders["std_encoder"] = DiffusionRgbEncoder(config)
+                # Count how many standard images we have
+                num_std_images = sum(1 for key in self.config.image_features if key in self.std_image_keys)
+                # Assuming all use the same encoder feature dimension
+                global_cond_dim_images += encoders["std_encoder"].feature_dim * num_std_images
+
+            # Mic (sound0, sound1) backbone (mic_num-ch)
+            # Note: We assume sound0 and sound1 are concatenated before being passed to this encoder
+            if any(key in self.config.image_features for key in self.mic_image_keys):
+                encoders["mic_encoder"] = DiffusionRgbEncoder(
+                    config, input_channels=config.mic_num, use_pretrained_weights=False
+                )
+                # We have one encoder output for the concatenated sound
+                global_cond_dim_images += encoders["mic_encoder"].feature_dim
+
+            # Spec (spec) backbone (1-ch)
+            if self.spec_image_key in self.config.image_features:
+                encoders["spec_encoder"] = DiffusionRgbEncoder(
+                    config, input_channels=1, use_pretrained_weights=False
+                )
+                global_cond_dim_images += encoders["spec_encoder"].feature_dim
+
+            self.rgb_encoder = nn.ModuleDict(encoders)
+            global_cond_dim += global_cond_dim_images
+
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
@@ -240,31 +265,80 @@ class DiffusionModel(nn.Module):
         global_cond_feats = [batch[OBS_STATE]]
         # Extract image features.
         if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
-                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            else:
-                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                )
-                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            global_cond_feats.append(img_features)
+            image_keys_list = list(batch.keys())  # We actually need checked keys from config to be safe
+            # But iterating over config.image_features ensures order.
+            
+            # Helper to find sound indices if we were strictly iterating batch keys, 
+            # but we can just access batch directly by key since we know them.
+            
+            img_features_list = []
+            
+            # Process keys in order of config.image_features to maintain determinism 
+            # relative to the order we might expect (though we concat all at the end).
+            # The order in `config.image_features` is preserved (dict).
+            
+            # However, we need to handle the sound0/sound1 logic where sound1 is skipped.
+            # And we need to know where to put the features.
+            # ACT implementation loops over keys and appends tokens. 
+            # Here we need to append features to a list and then stack/concat them.
+            
+            # Important: We must maintain the order of features relative to the keys in config.image_features?
+            # Or just concat everything in a consistent order? 
+            # The previous implementation was:
+            # - separate: cat([encoder(img) for i in cameras]) -> (B, S, N*D)
+            # - shared: encoder(stack(imgs)) -> (B, S, N*D)
+            
+            # Since we are flattening everything to (B, global_cond_dim), the order matters for the linear layers 
+            # (which are inside the Unet conditioning, effectively). 
+            # Changing the order changes the weight mapping. We should try to follow `config.image_features` order.
+            
+            processed_sound = False
+            
+            for key in self.config.image_features:
+                if key in self.std_image_keys:
+                    # (B, S, C, H, W) -> (B*S, C, H, W)
+                    imgs = einops.rearrange(batch[key], "b s ... -> (b s) ...")
+                    feats = self.rgb_encoder["std_encoder"](imgs)
+                    # (B*S, D) -> (B, S, D)
+                    feats = einops.rearrange(feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+                    img_features_list.append(feats)
+                    
+                elif key in self.mic_image_keys:
+                    if processed_sound:
+                        continue
+                    
+                    # Concat sound0 and sound1
+                    # Assume both exist if one does, or handle gracefully? 
+                    # ACT assumes both exist if one acts as trigger.
+                    # We will concat all available mic keys in order.
+                    mic_imgs = []
+                    # strictly sort to ensure 0 then 1
+                    for mic_key in sorted(self.mic_image_keys):
+                        if mic_key in self.config.image_features:
+                             mic_imgs.append(batch[mic_key])
+                    
+                    # (B, S, C, H, W) -> stack/cat C dim
+                    combined_mic = torch.cat(mic_imgs, dim=2)
+                    # Slice to mic_num
+                    combined_mic = combined_mic[:, :, :self.config.mic_num, :, :]
+                    
+                    imgs = einops.rearrange(combined_mic, "b s ... -> (b s) ...")
+                    feats = self.rgb_encoder["mic_encoder"](imgs)
+                    feats = einops.rearrange(feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+                    img_features_list.append(feats)
+                    processed_sound = True
+                    
+                elif key == self.spec_image_key:
+                    # Slice first channel
+                    spec_img = batch[key][:, :, 0:1, :, :]
+                    imgs = einops.rearrange(spec_img, "b s ... -> (b s) ...")
+                    feats = self.rgb_encoder["spec_encoder"](imgs)
+                    feats = einops.rearrange(feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+                    img_features_list.append(feats)
+                    
+            if len(img_features_list) > 0:
+                 img_features = torch.cat(img_features_list, dim=-1)
+                 global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
@@ -315,7 +389,7 @@ class DiffusionModel(nn.Module):
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
-        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
+        assert any(key in batch for key in self.config.image_features) or OBS_ENV_STATE in batch
         n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon
@@ -442,7 +516,13 @@ class DiffusionRgbEncoder(nn.Module):
     Includes the ability to normalize and crop the image first.
     """
 
-    def __init__(self, config: DiffusionConfig):
+    def __init__(
+        self,
+        config: DiffusionConfig,
+        image_key: str | None = None,
+        input_channels: int | None = None,
+        use_pretrained_weights: bool = True,
+    ):
         super().__init__()
         # Set up optional preprocessing.
         if config.crop_shape is not None:
@@ -456,15 +536,41 @@ class DiffusionRgbEncoder(nn.Module):
         else:
             self.do_crop = False
 
+        if input_channels is not None:
+            num_channels = input_channels
+        elif image_key is not None:
+            num_channels = config.image_features[image_key].shape[0]
+        else:
+            # Fallback to the first image feature
+            num_channels = next(iter(config.image_features.values())).shape[0]
+
         # Set up backbone.
-        backbone_model = getattr(torchvision.models, config.vision_backbone)(
-            weights=config.pretrained_backbone_weights
-        )
+        # If the input has 3 channels, we can use pretrained weights.
+        # Otherwise, we use no weights (and modify the first layer).
+        if num_channels == 3 and use_pretrained_weights:
+            weights = config.pretrained_backbone_weights
+        else:
+            weights = None
+
+        backbone_model = getattr(torchvision.models, config.vision_backbone)(weights=weights)
+
+        if num_channels != 3:
+            # Replace the first conv layer to accept different number of channels.
+            # We use the same parameters as the original conv1 (except for input channels).
+            backbone_model.conv1 = nn.Conv2d(
+                num_channels,
+                backbone_model.conv1.out_channels,
+                kernel_size=backbone_model.conv1.kernel_size,
+                stride=backbone_model.conv1.stride,
+                padding=backbone_model.conv1.padding,
+                bias=backbone_model.conv1.bias is not None,
+            )
+
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
         if config.use_group_norm:
-            if config.pretrained_backbone_weights:
+            if config.pretrained_backbone_weights and weights is not None:
                 raise ValueError(
                     "You can't replace BatchNorm in a pretrained model without ruining the weights!"
                 )
@@ -476,14 +582,19 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
-        # The dummy input should take the number of image channels from `config.image_features` and it should
-        # use the height and width from `config.crop_shape` if it is provided, otherwise it should use the
-        # height and width from `config.image_features`.
+        # The dummy input should take the number of image channels from `num_channels`
+        # and it should use the height and width from `config.crop_shape` if it is provided,
+        # otherwise it should use the height and width from `config.image_features`.
 
-        # Note: we have a check in the config class to make sure all images have the same shape.
-        images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
+        # Note: we have a check in the config class to make sure all images have the same shape
+        # (if use_separate_rgb_encoder_per_camera is False), but here we just need A shape.
+        if image_key is not None:
+             h, w = config.image_features[image_key].shape[1:]
+        else:
+             h, w = next(iter(config.image_features.values())).shape[1:]
+
+        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else (h, w)
+        dummy_shape = (1, num_channels, *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
