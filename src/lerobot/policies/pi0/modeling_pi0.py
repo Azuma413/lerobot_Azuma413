@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+import torchvision
 from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available
@@ -524,6 +525,51 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
         self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # Define image key categories for multi-modal processing
+        self.std_image_keys = ["observation.images.front", "observation.images.side"]
+        self.mic_image_keys = ["observation.images.sound0", "observation.images.sound1"]
+        self.spec_image_key = "observation.images.spec"
+
+        # Get the backbone model function
+        backbone_model_fn = getattr(torchvision.models, config.vision_backbone)
+
+        # Create mic_backbone for multi-channel microphone input
+        mic_backbone_model = backbone_model_fn(weights=None)
+        # Replace first conv layer to accept mic_num channels
+        orig_conv = mic_backbone_model.conv1
+        mic_backbone_model.conv1 = nn.Conv2d(
+            config.mic_num,
+            orig_conv.out_channels,
+            kernel_size=orig_conv.kernel_size,
+            stride=orig_conv.stride,
+            padding=orig_conv.padding,
+            bias=False,
+        )
+        # Remove final fc layer to get feature map
+        self.mic_backbone = nn.Sequential(*(list(mic_backbone_model.children())[:-1]))
+        mic_output_dim = mic_backbone_model.fc.in_features
+
+        # Create spec_backbone for single-channel spectrogram input
+        spec_backbone_model = backbone_model_fn(weights=None)
+        orig_conv = spec_backbone_model.conv1
+        spec_backbone_model.conv1 = nn.Conv2d(
+            1,  # Single channel input
+            orig_conv.out_channels,
+            kernel_size=orig_conv.kernel_size,
+            stride=orig_conv.stride,
+            padding=orig_conv.padding,
+            bias=False,
+        )
+        self.spec_backbone = nn.Sequential(*(list(spec_backbone_model.children())[:-1]))
+        spec_output_dim = spec_backbone_model.fc.in_features
+
+        # Get PaliGemma hidden dimension for projection
+        paligemma_hidden_dim = paligemma_config.width
+
+        # Projection layers to match PaliGemma hidden dimension
+        self.mic_proj = nn.Linear(mic_output_dim, paligemma_hidden_dim)
+        self.spec_proj = nn.Linear(spec_output_dim, paligemma_hidden_dim)
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -590,25 +636,96 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, image_keys=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
+        """Embed images with SigLIP or CNN backbones and language tokens with embedding layer.
+        
+        Args:
+            images: List of image tensors
+            img_masks: List of mask tensors
+            lang_tokens: Language token tensor
+            lang_masks: Language mask tensor
+            image_keys: Optional list of image keys to identify processing type
+        """
         embs = []
         pad_masks = []
         att_masks = []
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        # Track which mic images we've seen for combining
+        mic_images_collected = []
+        mic_masks_collected = []
+        mic_indices = []
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+        # If no image_keys provided, process all as standard images
+        if image_keys is None:
+            image_keys = [None] * len(images)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-            bsize, num_img_embs = img_emb.shape[:2]
+        # First pass: identify mic images for combination
+        for idx, key in enumerate(image_keys):
+            if key in self.mic_image_keys:
+                mic_indices.append(idx)
 
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-            att_masks += [0] * num_img_embs
+        # Process images IN ORDER to maintain consistency
+        processed_mic = False
+        for idx, (img, img_mask, key) in enumerate(zip(images, img_masks, image_keys, strict=True)):
+            # Handle mic images: combine sound0 and sound1
+            if key in self.mic_image_keys:
+                mic_images_collected.append(img)
+                mic_masks_collected.append(img_mask)
+                
+                # Process combined mic images when we hit the last mic index
+                if idx == max(mic_indices) and not processed_mic:
+                    processed_mic = True
+                    # Concat along channel dim
+                    combined_mic_img = torch.cat(mic_images_collected, dim=1)
+                    # Slice to mic_num channels
+                    mic_input = combined_mic_img[:, : self.config.mic_num, :, :]
+                    
+                    # Process with mic_backbone
+                    def mic_embed_func(x):
+                        features = self.mic_backbone(x)
+                        features = features.flatten(1)  # (B, C)
+                        return self.mic_proj(features)  # (B, hidden_dim)
+                    
+                    mic_emb = self._apply_checkpoint(mic_embed_func, mic_input)
+                    bsize = mic_emb.shape[0]
+                    
+                    # Add as single token
+                    embs.append(mic_emb.unsqueeze(1))  # (B, 1, hidden_dim)
+                    # Use first mask (all mic images should have same mask)
+                    pad_masks.append(mic_masks_collected[0][:, None])
+                    att_masks += [0]
+                continue
+            
+            # Handle spec images
+            elif key == self.spec_image_key:
+                # Select first channel only
+                spec_input = img[:, 0:1, :, :]
+                
+                def spec_embed_func(x):
+                    features = self.spec_backbone(x)
+                    features = features.flatten(1)  # (B, C)
+                    return self.spec_proj(features)  # (B, hidden_dim)
+                
+                spec_emb = self._apply_checkpoint(spec_embed_func, spec_input)
+                bsize = spec_emb.shape[0]
+                
+                # Add as single token
+                embs.append(spec_emb.unsqueeze(1))  # (B, 1, hidden_dim)
+                pad_masks.append(img_mask[:, None])
+                att_masks += [0]
+            
+            # Handle standard images (SigLIP)
+            else:
+                def image_embed_func(img):
+                    return self.paligemma_with_expert.embed_image(img)
+
+                img_emb = self._apply_checkpoint(image_embed_func, img)
+                bsize, num_img_embs = img_emb.shape[:2]
+
+                embs.append(img_emb)
+                pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+                att_masks += [0] * num_img_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -696,7 +813,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, image_keys=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
@@ -710,7 +827,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, image_keys
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
@@ -756,7 +873,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
-        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, num_steps=None
+        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, num_steps=None, image_keys=None
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
@@ -775,7 +892,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, image_keys
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1115,14 +1232,15 @@ class PI0Policy(PreTrainedPolicy):
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
             img_masks.append(mask)
 
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
+        # Add missing keys with empty masks
+        for missing_key in missing_img_keys:
             img = torch.ones_like(img) * -1  # padded with -1 for SigLIP
             mask = torch.zeros_like(mask)  # mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
+            present_img_keys.append(missing_key)
 
-        return images, img_masks
+        return images, img_masks, present_img_keys
 
     def prepare_state(self, batch):
         """Pad state"""
@@ -1153,12 +1271,12 @@ class PI0Policy(PreTrainedPolicy):
         self.eval()
 
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        images, img_masks, image_keys = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
 
         # Sample actions using the model
-        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state)
+        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, image_keys=image_keys)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1170,13 +1288,13 @@ class PI0Policy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training."""
 
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        images, img_masks, image_keys = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
 
         # Compute loss
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, image_keys=image_keys)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]

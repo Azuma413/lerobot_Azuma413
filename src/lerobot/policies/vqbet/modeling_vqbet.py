@@ -132,11 +132,13 @@ class VQBeTPolicy(PreTrainedPolicy):
         if ACTION in batch:
             batch.pop(ACTION)
         batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-        # NOTE: It's important that this happens after stacking the images into a single key.
-        batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
-        if ACTION in batch:
-            batch.pop(ACTION)
+
+        # Store image keys for proper backbone routing
+        image_keys = list(self.config.image_features.keys())
+        batch["image_keys"] = image_keys
+
+        # Stack images but also keep individual images for multi-backbone processing
+        batch[OBS_IMAGES] = [batch[key] for key in image_keys]
 
         self._queues = populate_queues(self._queues, batch)
 
@@ -157,7 +159,14 @@ class VQBeTPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-        batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+
+        # Store image keys for proper backbone routing
+        image_keys = list(self.config.image_features.keys())
+        batch["image_keys"] = image_keys
+
+        # Keep images as a list for multi-backbone processing
+        batch[OBS_IMAGES] = [batch[key] for key in image_keys]
+
         # VQ-BeT discretizes action using VQ-VAE before training BeT (please refer to section 3.2 in the VQ-BeT paper https://huggingface.co/papers/2403.03181)
         if not self.vqbet.action_head.vqvae_model.discretized.item():
             # loss: total loss of training RVQ
@@ -313,7 +322,11 @@ class VQBeTModel(nn.Module):
         self.config = config
 
         self.rgb_encoder = VQBeTRgbEncoder(config)
-        self.num_images = len(self.config.image_features)
+        # Store image keys for consistent ordering
+        self.image_keys = list(config.image_features.keys())
+        # Number of output features from encoder (mic images are combined into one)
+        self._compute_num_image_features()
+
         # This action query token is used as a prompt for querying action chunks. Please refer to "A_Q" in the image above.
         # Note: During the forward pass, this token is repeated as many times as needed. The authors also experimented with initializing the necessary number of tokens independently and observed inferior results.
         self.action_token = nn.Parameter(torch.randn(1, 1, self.config.gpt_input_dim))
@@ -338,24 +351,59 @@ class VQBeTModel(nn.Module):
             torch.row_stack([torch.arange(i, i + self.config.action_chunk_size) for i in range(num_tokens)]),
         )
 
+    def _compute_num_image_features(self):
+        """Compute the number of image features that will be output by the encoder."""
+        mic_keys = self.rgb_encoder.mic_image_keys
+        mic_count = sum(1 for k in self.image_keys if k in mic_keys)
+        # Mic images are combined into one, so we only count them once
+        if mic_count > 0:
+            self.num_image_features = len(self.image_keys) - mic_count + 1
+        else:
+            self.num_image_features = len(self.image_keys)
+
     def forward(self, batch: dict[str, Tensor], rollout: bool) -> tuple[dict, dict]:
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, OBS_IMAGES})
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
-        # Extract image feature (first combine batch and sequence dims).
-        img_features = self.rgb_encoder(einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ..."))
-        # Separate batch and sequence dims.
-        img_features = einops.rearrange(
-            img_features, "(b s n) ... -> b s n ...", b=batch_size, s=n_obs_steps, n=self.num_images
-        )
+        # Get image keys from batch or use stored keys
+        image_keys = batch.get("image_keys", self.image_keys)
+
+        # Handle both list format and stacked tensor format
+        if isinstance(batch[OBS_IMAGES], list):
+            # New format: list of tensors (B, S, C, H, W)
+            images_list = batch[OBS_IMAGES]
+
+            # Process images for each observation step
+            all_features = []
+            for s in range(n_obs_steps):
+                # Extract images for this time step
+                step_images = [img[:, s] for img in images_list]  # List of (B, C, H, W)
+                # Process through multi-backbone encoder
+                step_features = self.rgb_encoder.forward_with_keys(step_images, image_keys)
+                all_features.append(step_features)
+
+            # Reorganize: from [n_steps, n_features, (B, D)] to (B, n_steps, n_features, D)
+            n_features = len(all_features[0])
+            img_features = torch.stack([
+                torch.stack([all_features[s][f] for s in range(n_obs_steps)], dim=1)
+                for f in range(n_features)
+            ], dim=2)  # (B, S, n_features, D)
+        else:
+            # Legacy format: stacked tensor (B, S, N, C, H, W)
+            # Extract image feature (first combine batch and sequence dims).
+            img_features = self.rgb_encoder(einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ..."))
+            # Separate batch and sequence dims.
+            img_features = einops.rearrange(
+                img_features, "(b s n) ... -> b s n ...", b=batch_size, s=n_obs_steps, n=len(self.image_keys)
+            )
 
         # Arrange prior and current observation step tokens as shown in the class docstring.
         # First project features to token dimension.
         rgb_tokens = self.rgb_feature_projector(
             img_features
-        )  # (batch, obs_step, number of different cameras, projection dims)
+        )  # (batch, obs_step, number of features, projection dims)
         input_tokens = [rgb_tokens[:, :, i] for i in range(rgb_tokens.size(2))]
         input_tokens.append(self.state_projector(batch[OBS_STATE]))  # (batch, obs_step, projection dims)
         input_tokens.append(einops.repeat(self.action_token, "1 1 d -> b n d", b=batch_size, n=n_obs_steps))
@@ -371,11 +419,14 @@ class VQBeTModel(nn.Module):
 
         # get action features (pass through GPT)
         features = self.policy(input_tokens)
+
+        # Compute number of input feature types for action index calculation
+        # This includes: num_image_features + state + action_token
+        num_feature_types = self.num_image_features + 1  # +1 for state (action token handled separately in index calc)
+
         # len(self.config.input_features) is the number of different observation modes.
         # this line gets the index of action prompt tokens.
-        historical_act_pred_index = np.arange(0, n_obs_steps) * (len(self.config.input_features) + 1) + len(
-            self.config.input_features
-        )
+        historical_act_pred_index = np.arange(0, n_obs_steps) * (num_feature_types + 1) + num_feature_types
 
         # only extract the output tokens at the position of action query:
         # Behavior Transformer (BeT), and VQ-BeT are both sequence-to-sequence prediction models,
@@ -645,19 +696,28 @@ class VQBeTHead(nn.Module):
 
 
 class VQBeTRgbEncoder(nn.Module):
-    """Encode an RGB image into a 1D feature vector.
+    """Encode RGB images, microphone audio, and spectrograms into 1D feature vectors.
 
-    Includes the ability to normalize and crop the image first.
+    Supports three types of visual inputs with specialized backbones:
+    - Standard RGB images (3 channels): front, side cameras
+    - Microphone audio (mic_num channels): sound0, sound1 concatenated
+    - Spectrogram (1 channel): spec input
 
-    Same with DiffusionRgbEncoder from modeling_diffusion.py
+    Similar to DiffusionRgbEncoder and ACT's multi-backbone approach.
     """
 
     def __init__(self, config: VQBeTConfig):
         super().__init__()
-        # Set up optional preprocessing.
+        self.config = config
+
+        # Define image key categories
+        self.std_image_keys = ["observation.images.front", "observation.images.side"]
+        self.mic_image_keys = ["observation.images.sound0", "observation.images.sound1"]
+        self.spec_image_key = "observation.images.spec"
+
+        # Set up optional preprocessing (cropping)
         if config.crop_shape is not None:
             self.do_crop = True
-            # Always use center crop for eval
             self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
             if config.crop_is_random:
                 self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
@@ -666,59 +726,221 @@ class VQBeTRgbEncoder(nn.Module):
         else:
             self.do_crop = False
 
-        # Set up backbone.
-        backbone_model = getattr(torchvision.models, config.vision_backbone)(
-            weights=config.pretrained_backbone_weights
-        )
-        # Note: This assumes that the layer4 feature map is children()[-3]
-        # TODO(alexander-soare): Use a safer alternative.
-        self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
-        if config.use_group_norm:
-            if config.pretrained_backbone_weights:
-                raise ValueError(
-                    "You can't replace BatchNorm in a pretrained model without ruining the weights!"
+        # Track which backbones are needed
+        self.has_std_backbone = any(key in config.image_features for key in self.std_image_keys)
+        self.has_mic_backbone = any(key in config.image_features for key in self.mic_image_keys)
+        self.has_spec_backbone = self.spec_image_key in config.image_features
+
+        # Get backbone model factory
+        backbone_model_fn = getattr(torchvision.models, config.vision_backbone)
+
+        # Standard 3-channel backbone (for front, side cameras)
+        if self.has_std_backbone:
+            backbone_model = backbone_model_fn(weights=config.pretrained_backbone_weights)
+            self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+            if config.use_group_norm:
+                if config.pretrained_backbone_weights:
+                    raise ValueError(
+                        "You can't replace BatchNorm in a pretrained model without ruining the weights!"
+                    )
+                self.backbone = _replace_submodules(
+                    root_module=self.backbone,
+                    predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                    func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
                 )
-            self.backbone = _replace_submodules(
-                root_module=self.backbone,
-                predicate=lambda x: isinstance(x, nn.BatchNorm2d),
-                func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
+
+        # Microphone backbone (mic_num channels) - no pretrained weights
+        if self.has_mic_backbone:
+            mic_backbone_model = backbone_model_fn(weights=None)
+            # Replace first conv layer for mic_num channels
+            orig_conv = mic_backbone_model.conv1
+            mic_backbone_model.conv1 = nn.Conv2d(
+                config.mic_num,
+                orig_conv.out_channels,
+                kernel_size=orig_conv.kernel_size,
+                stride=orig_conv.stride,
+                padding=orig_conv.padding,
+                bias=False,
             )
+            self.mic_backbone = nn.Sequential(*(list(mic_backbone_model.children())[:-2]))
+            if config.use_group_norm:
+                self.mic_backbone = _replace_submodules(
+                    root_module=self.mic_backbone,
+                    predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                    func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
+                )
 
-        # Set up pooling and final layers.
-        # Use a dry run to get the feature map shape.
-        # The dummy input should take the number of image channels from `config.image_features` and it should
-        # use the height and width from `config.crop_shape` if it is provided, otherwise it should use the
-        # height and width from `config.image_features`.
+        # Spectrogram backbone (1 channel) - no pretrained weights
+        if self.has_spec_backbone:
+            spec_backbone_model = backbone_model_fn(weights=None)
+            # Replace first conv layer for 1 channel
+            orig_conv = spec_backbone_model.conv1
+            spec_backbone_model.conv1 = nn.Conv2d(
+                1,
+                orig_conv.out_channels,
+                kernel_size=orig_conv.kernel_size,
+                stride=orig_conv.stride,
+                padding=orig_conv.padding,
+                bias=False,
+            )
+            self.spec_backbone = nn.Sequential(*(list(spec_backbone_model.children())[:-2]))
+            if config.use_group_norm:
+                self.spec_backbone = _replace_submodules(
+                    root_module=self.spec_backbone,
+                    predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                    func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
+                )
 
-        images_shape = next(iter(config.image_features.values())).shape
+        # Get feature map shape using a dry run with the first available backbone
+        # Use first image feature to determine dimensions
+        first_key = next(iter(config.image_features.keys()))
+        images_shape = config.image_features[first_key].shape
         dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
-        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
+        # Determine which backbone to use for getting feature map shape
+        if self.has_std_backbone:
+            dummy_input = torch.zeros(1, 3, *dummy_shape_h_w)
+            feature_map_shape = get_output_shape(self.backbone, dummy_input.shape)[1:]
+        elif self.has_mic_backbone:
+            dummy_input = torch.zeros(1, config.mic_num, *dummy_shape_h_w)
+            feature_map_shape = get_output_shape(self.mic_backbone, dummy_input.shape)[1:]
+        elif self.has_spec_backbone:
+            dummy_input = torch.zeros(1, 1, *dummy_shape_h_w)
+            feature_map_shape = get_output_shape(self.spec_backbone, dummy_input.shape)[1:]
+        else:
+            raise ValueError("No backbone available. Check image_features configuration.")
+
+        # Set up pooling and output layers (shared across all backbones)
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
         self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
         self.relu = nn.ReLU()
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, image_keys: list[str] | None = None) -> Tensor:
         """
+        Process images through appropriate backbones based on image keys.
+
         Args:
             x: (B, C, H, W) image tensor with pixel values in [0, 1].
+               When processing multiple images, this should be called per-image.
+            image_keys: Optional list of image keys to determine which backbone to use.
+                       If None, uses standard backbone.
         Returns:
             (B, D) image feature.
         """
-        # Preprocess: maybe crop (if it was set up in the __init__).
+        # Preprocess: maybe crop
         if self.do_crop:
-            if self.training:  # noqa: SIM108
+            if self.training:
                 x = self.maybe_random_crop(x)
             else:
-                # Always use center crop for eval.
                 x = self.center_crop(x)
-        # Extract backbone feature.
-        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
-        # Final linear layer with non-linearity.
+
+        # Select appropriate backbone based on channel count
+        # This is a simple heuristic when image_keys is not provided
+        in_channels = x.shape[1]
+
+        if in_channels == 3 and self.has_std_backbone:
+            features = self.backbone(x)
+        elif in_channels == self.config.mic_num and self.has_mic_backbone:
+            features = self.mic_backbone(x)
+        elif in_channels == 1 and self.has_spec_backbone:
+            features = self.spec_backbone(x)
+        elif self.has_std_backbone:
+            # Fallback to standard backbone
+            features = self.backbone(x)
+        elif self.has_mic_backbone:
+            features = self.mic_backbone(x)
+        elif self.has_spec_backbone:
+            features = self.spec_backbone(x)
+        else:
+            raise ValueError(f"No suitable backbone for input with {in_channels} channels")
+
+        # Pool and project
+        x = torch.flatten(self.pool(features), start_dim=1)
         x = self.relu(self.out(x))
         return x
+
+    def forward_with_keys(
+        self, images: list[Tensor], image_keys: list[str]
+    ) -> list[Tensor]:
+        """
+        Process multiple images through appropriate backbones based on their keys.
+
+        Args:
+            images: List of (B, C, H, W) image tensors
+            image_keys: List of image key names corresponding to each image
+
+        Returns:
+            List of (B, D) feature tensors in consistent order
+        """
+        features_list = []
+        mic_indices = []
+        mic_processed = False
+
+        # First pass: identify mic image indices
+        for idx, key in enumerate(image_keys):
+            if key in self.mic_image_keys:
+                mic_indices.append(idx)
+
+        # Process each image
+        for idx, (img, key) in enumerate(zip(images, image_keys)):
+            # Handle mic images: combine sound0 and sound1
+            if key in self.mic_image_keys:
+                if not mic_processed and len(mic_indices) > 0 and idx == min(mic_indices):
+                    # Collect and concatenate all mic images
+                    mic_imgs = [images[i] for i in sorted(mic_indices)]
+                    combined_mic = torch.cat(mic_imgs, dim=1)
+                    # Slice to mic_num channels
+                    mic_input = combined_mic[:, : self.config.mic_num, :, :]
+
+                    # Preprocess
+                    if self.do_crop:
+                        if self.training:
+                            mic_input = self.maybe_random_crop(mic_input)
+                        else:
+                            mic_input = self.center_crop(mic_input)
+
+                    # Process through mic backbone
+                    mic_features = self.mic_backbone(mic_input)
+                    mic_features = torch.flatten(self.pool(mic_features), start_dim=1)
+                    mic_features = self.relu(self.out(mic_features))
+                    features_list.append(mic_features)
+                    mic_processed = True
+                # Skip subsequent mic images
+                continue
+
+            # Handle spectrogram
+            elif key == self.spec_image_key:
+                # Extract first channel only
+                spec_input = img[:, 0:1, :, :]
+
+                # Preprocess
+                if self.do_crop:
+                    if self.training:
+                        spec_input = self.maybe_random_crop(spec_input)
+                    else:
+                        spec_input = self.center_crop(spec_input)
+
+                spec_features = self.spec_backbone(spec_input)
+                spec_features = torch.flatten(self.pool(spec_features), start_dim=1)
+                spec_features = self.relu(self.out(spec_features))
+                features_list.append(spec_features)
+
+            # Handle standard images (front, side, or any other)
+            else:
+                # Preprocess
+                if self.do_crop:
+                    if self.training:
+                        img = self.maybe_random_crop(img)
+                    else:
+                        img = self.center_crop(img)
+
+                std_features = self.backbone(img)
+                std_features = torch.flatten(self.pool(std_features), start_dim=1)
+                std_features = self.relu(self.out(std_features))
+                features_list.append(std_features)
+
+        return features_list
 
 
 def _replace_submodules(

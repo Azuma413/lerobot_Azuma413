@@ -295,28 +295,15 @@ class DiffusionModel(nn.Module):
             processed_sound = False
             
             for key in self.config.image_features:
-                if key in self.std_image_keys:
-                    # (B, S, C, H, W) -> (B*S, C, H, W)
-                    imgs = einops.rearrange(batch[key], "b s ... -> (b s) ...")
-                    feats = self.rgb_encoder["std_encoder"](imgs)
-                    # (B*S, D) -> (B, S, D)
-                    feats = einops.rearrange(feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
-                    img_features_list.append(feats)
-                    
-                elif key in self.mic_image_keys:
+                if key in self.mic_image_keys:
                     if processed_sound:
                         continue
-                    
                     # Concat sound0 and sound1
-                    # Assume both exist if one does, or handle gracefully? 
-                    # ACT assumes both exist if one acts as trigger.
-                    # We will concat all available mic keys in order.
                     mic_imgs = []
                     # strictly sort to ensure 0 then 1
                     for mic_key in sorted(self.mic_image_keys):
                         if mic_key in self.config.image_features:
-                             mic_imgs.append(batch[mic_key])
-                    
+                            mic_imgs.append(batch[mic_key])
                     # (B, S, C, H, W) -> stack/cat C dim
                     combined_mic = torch.cat(mic_imgs, dim=2)
                     # Slice to mic_num
@@ -335,10 +322,17 @@ class DiffusionModel(nn.Module):
                     feats = self.rgb_encoder["spec_encoder"](imgs)
                     feats = einops.rearrange(feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
                     img_features_list.append(feats)
+                else:
+                    # (B, S, C, H, W) -> (B*S, C, H, W)
+                    imgs = einops.rearrange(batch[key], "b s ... -> (b s) ...")
+                    feats = self.rgb_encoder["std_encoder"](imgs)
+                    # (B*S, D) -> (B, S, D)
+                    feats = einops.rearrange(feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+                    img_features_list.append(feats)
                     
             if len(img_features_list) > 0:
-                 img_features = torch.cat(img_features_list, dim=-1)
-                 global_cond_feats.append(img_features)
+                img_features = torch.cat(img_features_list, dim=-1)
+                global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])

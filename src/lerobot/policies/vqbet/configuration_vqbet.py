@@ -163,10 +163,9 @@ class VQBeTConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
-        # Note: this check was previously performed inside VQBeTRgbEncoder in the form of
-        # assert len(image_keys) == 1
-        if not len(self.image_features) == 1:
-            raise ValueError("You must provide only one image among the inputs.")
+        # Allow multiple images for multi-modal input (standard images, mic audio, spectrogram)
+        if len(self.image_features) < 1:
+            raise ValueError("You must provide at least one image among the inputs.")
 
         if self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
@@ -177,13 +176,8 @@ class VQBeTConfig(PreTrainedConfig):
                         f"`{key}`."
                     )
 
-        # Check that all input images have the same shape.
-        first_image_key, first_image_ft = next(iter(self.image_features.items()))
-        for key, image_ft in self.image_features.items():
-            if image_ft.shape != first_image_ft.shape:
-                raise ValueError(
-                    f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
-                )
+        # Note: We no longer require all images to have the same shape
+        # because mic and spec inputs have different channel counts
 
     @property
     def observation_delta_indices(self) -> list:
