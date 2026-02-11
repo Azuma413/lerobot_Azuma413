@@ -116,8 +116,30 @@ class VQBeTPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.vqbet(batch, rollout=True)[:, : self.config.action_chunk_size]
+        # Build batch from queues, handling OBS_IMAGES specially since it contains lists of tensors
+        new_batch = {}
+        for k in batch:
+            if k not in self._queues:
+                continue
+            queue_list = list(self._queues[k])
+            if k == OBS_IMAGES and isinstance(queue_list[0], list):
+                # Each element in queue_list is a list of tensors (one per image type)
+                # We need to stack each image type across time steps
+                num_image_types = len(queue_list[0])
+                stacked_images = []
+                for img_idx in range(num_image_types):
+                    # Collect all tensors for this image type across time steps
+                    images_for_type = [queue_list[t][img_idx] for t in range(len(queue_list))]
+                    stacked_images.append(torch.stack(images_for_type, dim=1))  # (B, S, C, H, W)
+                new_batch[k] = stacked_images
+            else:
+                new_batch[k] = torch.stack(queue_list, dim=1)
+        
+        # Copy over non-queue items like image_keys
+        if "image_keys" in batch:
+            new_batch["image_keys"] = batch["image_keys"]
+        
+        actions = self.vqbet(new_batch, rollout=True)[:, : self.config.action_chunk_size]
         return actions
 
     @torch.no_grad()
