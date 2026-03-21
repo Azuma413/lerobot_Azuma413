@@ -207,14 +207,8 @@ class DiffusionConfig(PreTrainedConfig):
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
-        if self.crop_shape is not None:
-            for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
-                    raise ValueError(
-                        f"`crop_shape` should fit within the images shapes. Got {self.crop_shape} "
-                        f"for `crop_shape` and {image_ft.shape} for "
-                        f"`{key}`."
-                    )
+        # Note: crop_shape is now used as the target size for Resize (not Crop),
+        # so no constraint that crop_shape must be smaller than image_shape.
 
         # Check that all input images have the same shape.
         if len(self.image_features) > 0 and not self.use_separate_rgb_encoder_per_camera:

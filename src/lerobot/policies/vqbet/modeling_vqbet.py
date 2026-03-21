@@ -737,16 +737,12 @@ class VQBeTRgbEncoder(nn.Module):
         self.mic_image_keys = ["observation.images.sound0", "observation.images.sound1"]
         self.spec_image_key = "observation.images.spec"
 
-        # Set up optional preprocessing (cropping)
+        # Set up optional preprocessing (resizing)
         if config.crop_shape is not None:
-            self.do_crop = True
-            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
-            if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
-            else:
-                self.maybe_random_crop = self.center_crop
+            self.do_resize = True
+            self.resize = torchvision.transforms.Resize(config.crop_shape)
         else:
-            self.do_crop = False
+            self.do_resize = False
 
         # Track which backbones are needed
         self.has_std_backbone = any(key in config.image_features for key in self.std_image_keys)
@@ -850,12 +846,9 @@ class VQBeTRgbEncoder(nn.Module):
         Returns:
             (B, D) image feature.
         """
-        # Preprocess: maybe crop
-        if self.do_crop:
-            if self.training:
-                x = self.maybe_random_crop(x)
-            else:
-                x = self.center_crop(x)
+        # Preprocess: maybe resize
+        if self.do_resize:
+            x = self.resize(x)
 
         # Select appropriate backbone based on channel count
         # This is a simple heuristic when image_keys is not provided
@@ -916,11 +909,8 @@ class VQBeTRgbEncoder(nn.Module):
                     mic_input = combined_mic[:, : self.config.mic_num, :, :]
 
                     # Preprocess
-                    if self.do_crop:
-                        if self.training:
-                            mic_input = self.maybe_random_crop(mic_input)
-                        else:
-                            mic_input = self.center_crop(mic_input)
+                    if self.do_resize:
+                        mic_input = self.resize(mic_input)
 
                     # Process through mic backbone
                     mic_features = self.mic_backbone(mic_input)
@@ -937,11 +927,8 @@ class VQBeTRgbEncoder(nn.Module):
                 spec_input = img[:, 0:1, :, :]
 
                 # Preprocess
-                if self.do_crop:
-                    if self.training:
-                        spec_input = self.maybe_random_crop(spec_input)
-                    else:
-                        spec_input = self.center_crop(spec_input)
+                if self.do_resize:
+                    spec_input = self.resize(spec_input)
 
                 spec_features = self.spec_backbone(spec_input)
                 spec_features = torch.flatten(self.pool(spec_features), start_dim=1)
@@ -951,11 +938,8 @@ class VQBeTRgbEncoder(nn.Module):
             # Handle standard images (front, side, or any other)
             else:
                 # Preprocess
-                if self.do_crop:
-                    if self.training:
-                        img = self.maybe_random_crop(img)
-                    else:
-                        img = self.center_crop(img)
+                if self.do_resize:
+                    img = self.resize(img)
 
                 std_features = self.backbone(img)
                 std_features = torch.flatten(self.pool(std_features), start_dim=1)

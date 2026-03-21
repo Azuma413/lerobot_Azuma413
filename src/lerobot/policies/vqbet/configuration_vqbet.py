@@ -167,14 +167,8 @@ class VQBeTConfig(PreTrainedConfig):
         if len(self.image_features) < 1:
             raise ValueError("You must provide at least one image among the inputs.")
 
-        if self.crop_shape is not None:
-            for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
-                    raise ValueError(
-                        f"`crop_shape` should fit within the images shapes. Got {self.crop_shape} "
-                        f"for `crop_shape` and {image_ft.shape} for "
-                        f"`{key}`."
-                    )
+        # Note: crop_shape is now used as the target size for Resize (not Crop),
+        # so no constraint that crop_shape must be smaller than image_shape.
 
         # Note: We no longer require all images to have the same shape
         # because mic and spec inputs have different channel counts
