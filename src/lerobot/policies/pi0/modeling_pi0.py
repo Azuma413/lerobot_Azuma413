@@ -545,8 +545,9 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             padding=orig_conv.padding,
             bias=False,
         )
-        # Remove final fc layer to get feature map
-        self.mic_backbone = nn.Sequential(*(list(mic_backbone_model.children())[:-1]))
+        # Remove final pool and fc layers to get 2D feature map
+        from torchvision.models._utils import IntermediateLayerGetter
+        self.mic_backbone = IntermediateLayerGetter(mic_backbone_model, return_layers={"layer4": "feature_map"})
         mic_output_dim = mic_backbone_model.fc.in_features
 
         # Create spec_backbone for single-channel spectrogram input
@@ -560,15 +561,19 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             padding=orig_conv.padding,
             bias=False,
         )
-        self.spec_backbone = nn.Sequential(*(list(spec_backbone_model.children())[:-1]))
+        self.spec_backbone = IntermediateLayerGetter(spec_backbone_model, return_layers={"layer4": "feature_map"})
         spec_output_dim = spec_backbone_model.fc.in_features
 
         # Get PaliGemma hidden dimension for projection
         paligemma_hidden_dim = paligemma_config.width
 
-        # Projection layers to match PaliGemma hidden dimension
-        self.mic_proj = nn.Linear(mic_output_dim, paligemma_hidden_dim)
-        self.spec_proj = nn.Linear(spec_output_dim, paligemma_hidden_dim)
+        from lerobot.policies.act.modeling_act import ACTSinusoidalPositionEmbedding2d
+        # Initialize 2D position embeddings for chunked audio features
+        self.audio_pos_embed = ACTSinusoidalPositionEmbedding2d(paligemma_hidden_dim // 2)
+
+        # 1x1 Conv layers to project features to PaliGemma hidden dimension while maintaining spatial structure
+        self.mic_proj = nn.Conv2d(mic_output_dim, paligemma_hidden_dim, kernel_size=1)
+        self.spec_proj = nn.Conv2d(spec_output_dim, paligemma_hidden_dim, kernel_size=1)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -683,18 +688,22 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     
                     # Process with mic_backbone
                     def mic_embed_func(x):
-                        features = self.mic_backbone(x)
-                        features = features.flatten(1)  # (B, C)
-                        return self.mic_proj(features)  # (B, hidden_dim)
+                        features = self.mic_backbone(x)["feature_map"]  # (B, C, H, W)
+                        features = self.mic_proj(features)  # (B, hidden_dim, H, W)
+                        pos_embed = self.audio_pos_embed(features).to(features.dtype)
+                        features = features + pos_embed
+                        import einops
+                        features = einops.rearrange(features, "b c h w -> b (h w) c")
+                        return features  # (B, H*W, hidden_dim)
                     
                     mic_emb = self._apply_checkpoint(mic_embed_func, mic_input)
-                    bsize = mic_emb.shape[0]
+                    bsize, num_mic_embs = mic_emb.shape[:2]
                     
-                    # Add as single token
-                    embs.append(mic_emb.unsqueeze(1))  # (B, 1, hidden_dim)
-                    # Use first mask (all mic images should have same mask)
-                    pad_masks.append(mic_masks_collected[0][:, None])
-                    att_masks += [0]
+                    # Add as sequence of tokens
+                    embs.append(mic_emb)  # (B, H*W, hidden_dim)
+                    # Use first mask and expand to all tokens
+                    pad_masks.append(mic_masks_collected[0][:, None].expand(bsize, num_mic_embs))
+                    att_masks += [0] * num_mic_embs
                 continue
             
             # Handle spec images
@@ -703,17 +712,21 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 spec_input = img[:, 0:1, :, :]
                 
                 def spec_embed_func(x):
-                    features = self.spec_backbone(x)
-                    features = features.flatten(1)  # (B, C)
-                    return self.spec_proj(features)  # (B, hidden_dim)
+                    features = self.spec_backbone(x)["feature_map"]  # (B, C, H, W)
+                    features = self.spec_proj(features)  # (B, hidden_dim, H, W)
+                    pos_embed = self.audio_pos_embed(features).to(features.dtype)
+                    features = features + pos_embed
+                    import einops
+                    features = einops.rearrange(features, "b c h w -> b (h w) c")
+                    return features  # (B, H*W, hidden_dim)
                 
                 spec_emb = self._apply_checkpoint(spec_embed_func, spec_input)
-                bsize = spec_emb.shape[0]
+                bsize, num_spec_embs = spec_emb.shape[:2]
                 
-                # Add as single token
-                embs.append(spec_emb.unsqueeze(1))  # (B, 1, hidden_dim)
-                pad_masks.append(img_mask[:, None])
-                att_masks += [0]
+                # Add as sequence of tokens
+                embs.append(spec_emb)  # (B, H*W, hidden_dim)
+                pad_masks.append(img_mask[:, None].expand(bsize, num_spec_embs))
+                att_masks += [0] * num_spec_embs
             
             # Handle standard images (SigLIP)
             else:

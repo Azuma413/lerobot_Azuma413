@@ -31,7 +31,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters, get_output_shape, populate_queues
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.vqbet.vqbet_utils import GPT, ResidualVQ
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 # ruff: noqa: N806
 
@@ -78,6 +78,8 @@ class VQBeTPolicy(PreTrainedPolicy):
             + [self.vqbet.action_token]
             + list(self.vqbet.action_head.map_to_cbet_preds_offset.parameters())
         )
+        if hasattr(self.vqbet, "env_state_projector"):
+            decay_params = decay_params + list(self.vqbet.env_state_projector.parameters())
 
         if self.config.sequentially_select:
             decay_params = (
@@ -113,6 +115,8 @@ class VQBeTPolicy(PreTrainedPolicy):
             OBS_STATE: deque(maxlen=self.config.n_obs_steps),
             ACTION: deque(maxlen=self.config.action_chunk_size),
         }
+        if self.config.env_state_feature:
+            self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -357,6 +361,10 @@ class VQBeTModel(nn.Module):
         self.state_projector = MLP(
             config.robot_state_feature.shape[0], hidden_channels=[self.config.gpt_input_dim]
         )
+        if config.env_state_feature:
+            self.env_state_projector = MLP(
+                config.env_state_feature.shape[0], hidden_channels=[self.config.gpt_input_dim]
+            )
         self.rgb_feature_projector = MLP(
             self.rgb_encoder.feature_dim, hidden_channels=[self.config.gpt_input_dim]
         )
@@ -428,6 +436,8 @@ class VQBeTModel(nn.Module):
         )  # (batch, obs_step, number of features, projection dims)
         input_tokens = [rgb_tokens[:, :, i] for i in range(rgb_tokens.size(2))]
         input_tokens.append(self.state_projector(batch[OBS_STATE]))  # (batch, obs_step, projection dims)
+        if self.config.env_state_feature:
+            input_tokens.append(self.env_state_projector(batch[OBS_ENV_STATE]))
         input_tokens.append(einops.repeat(self.action_token, "1 1 d -> b n d", b=batch_size, n=n_obs_steps))
         # Interleave tokens by stacking and rearranging.
         input_tokens = torch.stack(input_tokens, dim=2)
@@ -443,8 +453,10 @@ class VQBeTModel(nn.Module):
         features = self.policy(input_tokens)
 
         # Compute number of input feature types for action index calculation
-        # This includes: num_image_features + state + action_token
+        # This includes: num_image_features + state + action_token (+ optionally env_state)
         num_feature_types = self.num_image_features + 1  # +1 for state (action token handled separately in index calc)
+        if self.config.env_state_feature:
+            num_feature_types += 1
 
         # len(self.config.input_features) is the number of different observation modes.
         # this line gets the index of action prompt tokens.
