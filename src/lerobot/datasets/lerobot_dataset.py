@@ -922,8 +922,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if len(self.meta.video_keys) > 0:
             for ep_idx in requested_episodes:
                 for vid_key in self.meta.video_keys:
-                    video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-                    if not video_path.exists():
+                    image_dir = self._get_image_file_dir(ep_idx, vid_key)
+                    has_image_dir = image_dir.exists()
+                    has_video_path = False
+                    if f"videos/{vid_key}/chunk_index" in self.meta.episodes[ep_idx]:
+                        video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                        has_video_path = video_path.exists()
+                    if not has_video_path and not has_image_dir:
                         return False
 
         return True
@@ -1051,18 +1056,32 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Segmentation Fault. This probably happens because a memory reference to the video loader is created in
         the main process and a subprocess fails to access it.
         """
+        from PIL import Image
+
         ep = self.meta.episodes[ep_idx]
         item = {}
         for vid_key, query_ts in query_timestamps.items():
-            # Episodes are stored sequentially on a single mp4 to reduce the number of files.
-            # Thus we load the start timestamp of the episode on this mp4 and,
-            # shift the query timestamp accordingly.
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+            frames = None
+            from_timestamp_key = f"videos/{vid_key}/from_timestamp"
+            if from_timestamp_key in ep and f"videos/{vid_key}/chunk_index" in ep:
+                from_timestamp = ep[from_timestamp_key]
+                shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+                video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                if video_path.exists():
+                    frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+                    frames = frames.squeeze(0)
 
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
+            if frames is None:
+                image_tensors = []
+                for ts in query_ts:
+                    frame_index = max(0, int(round(float(ts) * self.fps)))
+                    image_path = self._get_image_file_path(ep_idx, vid_key, frame_index)
+                    with Image.open(image_path) as image:
+                        array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+                    image_tensors.append(torch.from_numpy(array).permute(2, 0, 1))
+                frames = image_tensors[0] if len(image_tensors) == 1 else torch.stack(image_tensors, dim=0)
+
+            item[vid_key] = frames
 
         return item
 
