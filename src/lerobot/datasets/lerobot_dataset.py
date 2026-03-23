@@ -1388,6 +1388,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
             f"Batch encoding {self.batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
         )
 
+        # Batched video encoding can run before episode metadata has been reloaded
+        # into memory, because metadata writes are buffered separately from data writes.
+        self.meta._flush_metadata_buffer()
+        self.meta.episodes = load_episodes(self.root)
+        if self.meta.episodes is None or len(self.meta.episodes) <= start_episode:
+            raise RuntimeError(
+                "Episode metadata is unavailable before batched video encoding. "
+                "Expected flushed entries in meta/episodes."
+            )
+
         chunk_idx = self.meta.episodes[start_episode]["data/chunk_index"]
         file_idx = self.meta.episodes[start_episode]["data/file_index"]
         episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
