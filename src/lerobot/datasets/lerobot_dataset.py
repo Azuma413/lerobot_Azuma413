@@ -36,6 +36,7 @@ from huggingface_hub.errors import RevisionNotFoundError
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.datasets.utils import (
+    DATA_DIR,
     DEFAULT_EPISODES_PATH,
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
@@ -117,35 +118,43 @@ class LeRobotDatasetMetadata:
         if not hasattr(self, "metadata_buffer") or len(self.metadata_buffer) == 0:
             return
 
-        combined_dict = {}
         flushed_rows = []
         for episode_dict in self.metadata_buffer:
             row_dict = {}
             for key, value in episode_dict.items():
-                if key not in combined_dict:
-                    combined_dict[key] = []
                 # Extract value and serialize numpy arrays
                 # because PyArrow's from_pydict function doesn't support numpy arrays
                 val = value[0] if isinstance(value, list) else value
                 serialized_val = val.tolist() if isinstance(val, np.ndarray) else val
-                combined_dict[key].append(serialized_val)
                 row_dict[key] = serialized_val
             flushed_rows.append(row_dict)
 
-        first_ep = self.metadata_buffer[0]
-        chunk_idx = first_ep["meta/episodes/chunk_index"][0]
-        file_idx = first_ep["meta/episodes/file_index"][0]
+        grouped_rows: dict[tuple[int, int], list[dict]] = {}
+        for row in flushed_rows:
+            chunk_idx = int(row["meta/episodes/chunk_index"])
+            file_idx = int(row["meta/episodes/file_index"])
+            grouped_rows.setdefault((chunk_idx, file_idx), []).append(row)
 
-        table = pa.Table.from_pydict(combined_dict)
-
-        if not self.writer:
+        for (chunk_idx, file_idx), rows in grouped_rows.items():
             path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
             path.parent.mkdir(parents=True, exist_ok=True)
-            self.writer = pq.ParquetWriter(
-                path, schema=table.schema, compression="snappy", use_dictionary=True
-            )
 
-        self.writer.write_table(table)
+            new_df = pd.DataFrame(rows)
+            if path.exists():
+                existing_df = pd.read_parquet(path)
+                merged_df = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                merged_df = new_df
+
+            if "episode_index" in merged_df.columns:
+                merged_df["episode_index"] = pd.to_numeric(merged_df["episode_index"], errors="coerce")
+                merged_df = (
+                    merged_df.sort_values("episode_index")
+                    .drop_duplicates(subset=["episode_index"], keep="last")
+                    .reset_index(drop=True)
+                )
+
+            merged_df.to_parquet(path)
 
         if self.episodes is None:
             self.episodes = flushed_rows
@@ -206,11 +215,7 @@ class LeRobotDatasetMetadata:
     def get_data_file_path(self, ep_index: int) -> Path:
         if self.episodes is None:
             self.episodes = load_episodes(self.root)
-        if ep_index >= len(self.episodes):
-            raise IndexError(
-                f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
-            )
-        ep = self.episodes[ep_index]
+        ep = self.get_episode_record(ep_index)
         chunk_idx = ep["data/chunk_index"]
         file_idx = ep["data/file_index"]
         fpath = self.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
@@ -219,15 +224,37 @@ class LeRobotDatasetMetadata:
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
         if self.episodes is None:
             self.episodes = load_episodes(self.root)
-        if ep_index >= len(self.episodes):
-            raise IndexError(
-                f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
-            )
-        ep = self.episodes[ep_index]
+        ep = self.get_episode_record(ep_index)
         chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
         file_idx = ep[f"videos/{vid_key}/file_index"]
+        if self.video_path is None:
+            raise ValueError(f"Dataset {self.repo_id} has no video_path configured")
+        if pd.isna(chunk_idx) or pd.isna(file_idx):
+            raise ValueError(
+                f"Episode {ep_index} has no encoded video metadata yet for key '{vid_key}'"
+            )
         fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
+
+    def get_episode_record(self, ep_index: int) -> dict:
+        if self.episodes is None:
+            self.episodes = load_episodes(self.root)
+        if self.episodes is None or len(self.episodes) == 0:
+            raise IndexError(f"No episode metadata found for dataset {self.repo_id}")
+        if 0 <= ep_index < len(self.episodes):
+            record = self.episodes[ep_index]
+            record_ep_index = record.get("episode_index")
+            if record_ep_index is not None and not pd.isna(record_ep_index) and int(record_ep_index) == ep_index:
+                return record
+        for row_idx in range(len(self.episodes)):
+            record = self.episodes[row_idx]
+            record_ep_index = record.get("episode_index")
+            if record_ep_index is not None and not pd.isna(record_ep_index) and int(record_ep_index) == ep_index:
+                return record
+        raise IndexError(
+            f"Episode index {ep_index} not found in metadata for dataset {self.repo_id}. "
+            f"Metadata rows available: {len(self.episodes)}"
+        )
 
     @property
     def data_path(self) -> str:
@@ -385,9 +412,12 @@ class LeRobotDatasetMetadata:
 
             if Path(latest_path).exists():
                 latest_size_in_mb = get_file_size_in_mb(Path(latest_path))
-                latest_num_frames = self.latest_episode["episode_index"][0]
-
-                av_size_per_frame = latest_size_in_mb / latest_num_frames if latest_num_frames > 0 else 0.0
+                # Estimate per-episode metadata growth using the number of episode rows,
+                # not the latest episode index value.
+                buffered_episodes = len(self.metadata_buffer)
+                persisted_episodes = len(self.episodes) if self.episodes is not None else 0
+                episode_rows = persisted_episodes + buffered_episodes
+                av_size_per_frame = latest_size_in_mb / episode_rows if episode_rows > 0 else 0.0
 
                 if latest_size_in_mb + av_size_per_frame * num_frames >= self.data_files_size_in_mb:
                     # Size limit is reached, flush buffer and prepare new parquet file
@@ -760,6 +790,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if not self._check_cached_episodes_sufficient():
                 raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
         except (FileNotFoundError, NotADirectoryError):
+            local_metadata_exists = (self.root / INFO_PATH).exists()
+            local_data_exists = (self.root / DATA_DIR).exists()
+            if root is not None and local_metadata_exists and local_data_exists:
+                raise FileNotFoundError(
+                    f"Local dataset at {self.root} is incomplete or corrupted. "
+                    "Skipping Hugging Face download fallback for explicit local paths."
+                )
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
             self.download(download_videos)
@@ -937,7 +974,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     image_dir = self._get_image_file_dir(ep_idx, vid_key)
                     has_image_dir = image_dir.exists()
                     has_video_path = False
-                    if f"videos/{vid_key}/chunk_index" in self.meta.episodes[ep_idx]:
+                    chunk_key = f"videos/{vid_key}/chunk_index"
+                    file_key = f"videos/{vid_key}/file_index"
+                    try:
+                        episode_meta = self.meta.get_episode_record(ep_idx)
+                    except IndexError:
+                        return False
+                    if (
+                        self.meta.video_path is not None
+                        and chunk_key in episode_meta
+                        and file_key in episode_meta
+                        and not pd.isna(episode_meta[chunk_key])
+                        and not pd.isna(episode_meta[file_key])
+                    ):
                         video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
                         has_video_path = video_path.exists()
                     if not has_video_path and not has_image_dir:
@@ -1000,7 +1049,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             - query_indices: Dict mapping keys to lists of absolute indices to query
             - padding: Dict mapping "{key}_is_pad" to boolean tensors indicating padded positions
         """
-        ep = self.meta.episodes[ep_idx]
+        ep = self.meta.get_episode_record(ep_idx)
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
         query_indices = {
@@ -1070,7 +1119,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         from PIL import Image
 
-        ep = self.meta.episodes[ep_idx]
+        ep = self.meta.get_episode_record(ep_idx)
         item = {}
         for vid_key, query_ts in query_timestamps.items():
             frames = None
@@ -1411,19 +1460,26 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 "Episode metadata is unavailable before batched video encoding. "
                 "Expected flushed entries in meta/episodes."
             )
-        episode_records = self.meta.episodes
+        def _load_episode_df(path: Path) -> pd.DataFrame:
+            df = pd.read_parquet(path)
+            if "episode_index" in df.columns:
+                df["episode_index"] = pd.to_numeric(df["episode_index"], errors="coerce")
+                df = df.set_index("episode_index", drop=False)
+            return df
 
-        chunk_idx = episode_records[start_episode]["data/chunk_index"]
-        file_idx = episode_records[start_episode]["data/file_index"]
+        start_record = self.meta.get_episode_record(start_episode)
+        chunk_idx = start_record["data/chunk_index"]
+        file_idx = start_record["data/file_index"]
         episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        episode_df = pd.read_parquet(episode_df_path)
+        episode_df = _load_episode_df(episode_df_path)
 
         for ep_idx in range(start_episode, end_episode):
             logging.info(f"Encoding videos for episode {ep_idx}")
+            episode_record = self.meta.get_episode_record(ep_idx)
 
             if (
-                episode_records[ep_idx]["data/chunk_index"] != chunk_idx
-                or episode_records[ep_idx]["data/file_index"] != file_idx
+                episode_record["data/chunk_index"] != chunk_idx
+                or episode_record["data/file_index"] != file_idx
             ):
                 # The current episode is in a new chunk or file.
                 # Save previous episode dataframe and switch to the parquet file
@@ -1431,24 +1487,36 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 episode_df.to_parquet(episode_df_path)
 
                 # Load new episode dataframe
-                chunk_idx = episode_records[ep_idx]["data/chunk_index"]
-                file_idx = episode_records[ep_idx]["data/file_index"]
+                chunk_idx = episode_record["data/chunk_index"]
+                file_idx = episode_record["data/file_index"]
                 episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(
                     chunk_index=chunk_idx, file_index=file_idx
                 )
-                episode_df = pd.read_parquet(episode_df_path)
+                episode_df = _load_episode_df(episode_df_path)
 
             # Save the current episode's video metadata to the dataframe
             video_ep_metadata = {}
             for video_key in self.meta.video_keys:
                 video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
             video_ep_metadata.pop("episode_index")
-            video_ep_df = pd.DataFrame(video_ep_metadata, index=[ep_idx]).convert_dtypes(
+            episode_index = episode_record["episode_index"]
+            if pd.isna(episode_index):
+                episode_index = ep_idx
+            episode_index = int(episode_index)
+            video_ep_df = pd.DataFrame(video_ep_metadata, index=pd.Index([episode_index], name="episode_index")).convert_dtypes(
                 dtype_backend="pyarrow"
             )  # allows NaN values along with integers
+            video_ep_df["episode_index"] = episode_index
 
-            episode_df = episode_df.combine_first(video_ep_df)
-            episode_df.to_parquet(episode_df_path)
+            episode_df = episode_df.combine_first(video_ep_df).sort_index()
+            episode_df.reset_index(drop=True).to_parquet(episode_df_path)
+
+            # Keep the latest encoded episode metadata in sync during batched encoding.
+            # Without this, each episode in the batch can be treated like a fresh start
+            # and overwrite the previous episode's video file instead of concatenating.
+            current_episode = dict(episode_record)
+            current_episode.update(video_ep_metadata)
+            self.meta.latest_episode = {key: [value] for key, value in current_episode.items()}
 
         self.meta.episodes = load_episodes(self.root)
 
