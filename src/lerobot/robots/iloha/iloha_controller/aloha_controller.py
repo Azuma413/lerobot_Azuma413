@@ -16,6 +16,8 @@ class AlohaController:
         left_robstride_port: str,
         right_dynamixel_port: str,
         left_dynamixel_port: str,
+        enable_right_arm: bool = True,
+        enable_left_arm: bool = True,
         right_robstride_constants: Optional[List[Any]] = None,
         right_dynamixel_constants: Optional[List[Any]] = None,
         left_robstride_constants: Optional[List[Any]] = None,
@@ -34,6 +36,9 @@ class AlohaController:
             left_robstride_constants: 左アーム RobStride設定リスト
             left_dynamixel_constants: 左アーム Dynamixel設定リスト
         """
+        if not enable_right_arm and not enable_left_arm:
+            raise ValueError("少なくとも片方のアームを有効にしてください")
+
         # デフォルト設定の読み込み
         if right_robstride_constants is None or right_dynamixel_constants is None:
             from .right_settings import (
@@ -84,36 +89,42 @@ class AlohaController:
         # アームコントローラーのインスタンス
         self.right_arm_controller: Optional[AlohaArmController] = None
         self.left_arm_controller: Optional[AlohaArmController] = None
+        self.enable_right_arm = enable_right_arm
+        self.enable_left_arm = enable_left_arm
 
         # 初期化パラメータを保存
-        self.right_params = {
-            "robstride_port": right_robstride_port,
-            "dynamixel_port": right_dynamixel_port,
-            "robstride_constants": right_robstride_constants,
-            "dynamixel_constants": right_dynamixel_constants,
-        }
-        self.left_params = {
-            "robstride_port": left_robstride_port,
-            "dynamixel_port": left_dynamixel_port,
-            "robstride_constants": left_robstride_constants,
-            "dynamixel_constants": left_dynamixel_constants,
-        }
+        self.right_params = None
+        self.left_params = None
+        if self.enable_right_arm:
+            self.right_params = {
+                "robstride_port": right_robstride_port,
+                "dynamixel_port": right_dynamixel_port,
+                "robstride_constants": right_robstride_constants,
+                "dynamixel_constants": right_dynamixel_constants,
+            }
+        if self.enable_left_arm:
+            self.left_params = {
+                "robstride_port": left_robstride_port,
+                "dynamixel_port": left_dynamixel_port,
+                "robstride_constants": left_robstride_constants,
+                "dynamixel_constants": left_dynamixel_constants,
+            }
 
     async def _initialize_controllers(self) -> None:
         """両アームコントローラーを初期化（並列実行）"""
         try:
             print("🤖 ALOHA双腕コントローラー初期化中...")
 
-            # 右アームと左アームのコントローラーを作成
-            self.right_arm_controller = AlohaArmController(**self.right_params)
-            self.left_arm_controller = AlohaArmController(**self.left_params)
+            tasks = []
+            if self.enable_right_arm and self.right_params is not None:
+                self.right_arm_controller = AlohaArmController(**self.right_params)
+                tasks.append(self.right_arm_controller.__aenter__())
+            if self.enable_left_arm and self.left_params is not None:
+                self.left_arm_controller = AlohaArmController(**self.left_params)
+                tasks.append(self.left_arm_controller.__aenter__())
 
-            # 両アームを並列に初期化
-            print("  両アーム並列初期化中...")
-            await asyncio.gather(
-                self.right_arm_controller.__aenter__(),
-                self.left_arm_controller.__aenter__(),
-            )
+            print("  有効なアームを初期化中...")
+            await asyncio.gather(*tasks)
 
             print("✅ ALOHA双腕コントローラー初期化完了!")
 
@@ -130,14 +141,19 @@ class AlohaController:
             right_arm: 右アームの目標位置
             left_arm: 左アームの目標位置
         """
-        if self.right_arm_controller is None or self.left_arm_controller is None:
-            raise RuntimeError("コントローラーが初期化されていません")
+        if self.enable_right_arm and self.right_arm_controller is None:
+            raise RuntimeError("右アームコントローラーが初期化されていません")
+        if self.enable_left_arm and self.left_arm_controller is None:
+            raise RuntimeError("左アームコントローラーが初期化されていません")
 
-        # 両アームを並列更新
-        await asyncio.gather(
-            self.right_arm_controller.update_pos(right_arm),
-            self.left_arm_controller.update_pos(left_arm),
-        )
+        tasks = []
+        if self.enable_right_arm and self.right_arm_controller is not None:
+            tasks.append(self.right_arm_controller.update_pos(right_arm))
+        if self.enable_left_arm and self.left_arm_controller is not None:
+            tasks.append(self.left_arm_controller.update_pos(left_arm))
+        if not tasks:
+            raise RuntimeError("コントローラーが初期化されていません")
+        await asyncio.gather(*tasks)
 
     async def update_motor_pos(
         self, arm: str, motor_num: int, target_pos: float
@@ -150,12 +166,13 @@ class AlohaController:
             motor_num: モーター番号 (1-7)
             target_pos: 目標位置 (radian)
         """
-        if self.right_arm_controller is None or self.left_arm_controller is None:
-            raise RuntimeError("コントローラーが初期化されていません")
-
         if arm == "right":
+            if self.right_arm_controller is None:
+                raise RuntimeError("右アームコントローラーが初期化されていません")
             await self.right_arm_controller.update_motor_pos(motor_num, target_pos)
         elif arm == "left":
+            if self.left_arm_controller is None:
+                raise RuntimeError("左アームコントローラーが初期化されていません")
             await self.left_arm_controller.update_motor_pos(motor_num, target_pos)
         else:
             raise ValueError("armは'right'または'left'を指定してください")
@@ -168,12 +185,13 @@ class AlohaController:
             arm: アーム指定 ("right" または "left")
             current_mA: 目標電流 (mA)
         """
-        if self.right_arm_controller is None or self.left_arm_controller is None:
-            raise RuntimeError("コントローラーが初期化されていません")
-
         if arm == "right":
+            if self.right_arm_controller is None:
+                raise RuntimeError("右アームコントローラーが初期化されていません")
             await self.right_arm_controller.set_gripper_current(current_mA)
         elif arm == "left":
+            if self.left_arm_controller is None:
+                raise RuntimeError("左アームコントローラーが初期化されていません")
             await self.left_arm_controller.set_gripper_current(current_mA)
         else:
             raise ValueError("armは'right'または'left'を指定してください")

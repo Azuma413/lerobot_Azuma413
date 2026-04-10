@@ -89,12 +89,16 @@ class Iloha():
                 self.config.left_robstride_port,
                 self.config.right_dynamixel_port,
                 self.config.left_dynamixel_port,
+                enable_right_arm=self.config.enable_right_arm,
+                enable_left_arm=self.config.enable_left_arm,
             )
             # AlohaControllerを非同期で初期化
             await self.aloha.__aenter__()
             # グリッパー電流を設定
-            await self.aloha.set_gripper_current("left", self.config.current_limit_gripper_L*1000)
-            await self.aloha.set_gripper_current("right", self.config.current_limit_gripper_R*1000)
+            if self.config.enable_left_arm:
+                await self.aloha.set_gripper_current("left", self.config.current_limit_gripper_L * 1000)
+            if self.config.enable_right_arm:
+                await self.aloha.set_gripper_current("right", self.config.current_limit_gripper_R * 1000)
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         action_L = AlohaArm(

@@ -9,6 +9,8 @@ class IlohaConfig(RobotConfig):
     left_robstride_port: str
     right_dynamixel_port: str
     left_dynamixel_port: str
+    enable_right_arm: bool = True
+    enable_left_arm: bool = True
     max_relative_target_1: float = 0.1 # radians
     max_relative_target_2: float = 0.1 # radians
     max_relative_target_3: float = 0.1 # radians
