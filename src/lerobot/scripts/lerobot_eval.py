@@ -289,6 +289,9 @@ def eval_policy(
         except ImportError:
             raise exc from None
 
+    if hasattr(env, "materialize"):
+        env = env.materialize()
+
     start = time.time()
     policy.eval()
 
@@ -657,20 +660,25 @@ def run_one(
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
 
-    # Call the existing eval_one (assumed to return TaskMetrics-like dict)
-    metrics = eval_one(
-        env,
-        policy=policy,
-        env_preprocessor=env_preprocessor,
-        env_postprocessor=env_postprocessor,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        n_episodes=n_episodes,
-        max_episodes_rendered=max_episodes_rendered,
-        videos_dir=task_videos_dir,
-        return_episode_data=return_episode_data,
-        start_seed=start_seed,
-    )
+    try:
+        # Call the existing eval_one (assumed to return TaskMetrics-like dict)
+        metrics = eval_one(
+            env,
+            policy=policy,
+            env_preprocessor=env_preprocessor,
+            env_postprocessor=env_postprocessor,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            n_episodes=n_episodes,
+            max_episodes_rendered=max_episodes_rendered,
+            videos_dir=task_videos_dir,
+            return_episode_data=return_episode_data,
+            start_seed=start_seed,
+        )
+    finally:
+        if hasattr(env, "close"):
+            env.close()
+
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
         metrics.setdefault("video_paths", [])

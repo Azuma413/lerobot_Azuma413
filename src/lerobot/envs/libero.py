@@ -353,6 +353,29 @@ class LiberoEnv(gym.Env):
         self._env.close()
 
 
+class LazyVectorEnv:
+    """Create expensive LIBERO vector envs only when a task is actually evaluated."""
+
+    def __init__(self, env_cls: Callable[[Sequence[Callable[[], Any]]], Any], fns: Sequence[Callable[[], Any]]):
+        self._env_cls = env_cls
+        self._fns = list(fns)
+        self._env = None
+        self.num_envs = len(self._fns)
+
+    def materialize(self):
+        if self._env is None:
+            self._env = self._env_cls(self._fns)
+        return self._env
+
+    def close(self):
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+
+    def __getattr__(self, name: str):
+        return getattr(self.materialize(), name)
+
+
 def _make_env_fns(
     *,
     suite,
@@ -450,8 +473,8 @@ def create_libero_envs(
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
             )
-            out[suite_name][tid] = env_cls(fns)
-            print(f"Built vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
+            out[suite_name][tid] = LazyVectorEnv(env_cls, fns)
+            print(f"Prepared lazy vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
 
     # return plain dicts for predictability
     return {suite: dict(task_map) for suite, task_map in out.items()}
