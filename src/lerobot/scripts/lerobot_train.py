@@ -15,8 +15,10 @@
 # limitations under the License.
 import dataclasses
 import logging
+import os
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from pprint import pformat
 from typing import Any
 
@@ -174,15 +176,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        process_group_timeout = int(os.environ.get("LEROBOT_DISTRIBUTED_TIMEOUT_SECONDS", "43200"))
+        init_process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=process_group_timeout))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, init_process_group_kwargs],
             cpu=force_cpu,
         )
 
