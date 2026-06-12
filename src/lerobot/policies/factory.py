@@ -396,6 +396,16 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif policy_cfg.type == "sarm_goal":
+        from sentinel.monitor.sarm_goal import make_sarm_goal_pre_post_processors
+
+        processors = make_sarm_goal_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+            dataset_meta=kwargs.get("dataset_meta"),
+            dataset=kwargs.get("dataset"),
+        )
+
     elif isinstance(policy_cfg, SARMConfig):
         from lerobot.policies.sarm.processor_sarm import make_sarm_pre_post_processors
 

@@ -271,9 +271,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    # For SARM, always provide dataset_meta for progress normalization
-    if cfg.policy.type == "sarm":
+    # For SARM/SARM-G, always provide dataset metadata for progress normalization.
+    # SARM-G also needs the dataset itself to fetch hindsight goal frames.
+    if cfg.policy.type in ("sarm", "sarm_goal"):
         processor_kwargs["dataset_meta"] = dataset.meta
+    if cfg.policy.type == "sarm_goal":
+        processor_kwargs["dataset"] = dataset
 
     if processor_pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
