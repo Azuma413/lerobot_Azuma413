@@ -239,6 +239,8 @@ def rollout(
     if return_observations:
         stacked_observations = {}
         for key in all_observations[0]:
+            if not isinstance(all_observations[0][key], torch.Tensor):
+                continue
             stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
         ret[OBS_STR] = stacked_observations
 
