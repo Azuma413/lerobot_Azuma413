@@ -111,6 +111,47 @@ def _env_features_to_dataset_features(env_features: dict) -> dict:
     return features
 
 
+def _processed_observation_to_dataset_features(
+    observation: dict[str, Any], env_features: dict
+) -> dict[str, dict[str, Any]]:
+    """Build a recording schema from the observation seen by the policy.
+
+    Environment processors may replace a nested simulator observation with a
+    canonical feature (LIBERO, for example, produces an 8-D
+    "observation.state"). Recording the raw environment schema therefore drops
+    the feature actually consumed by the policy. Infer observation features
+    after the environment processor while retaining the action shape declared
+    by the environment config.
+    """
+
+    features: dict[str, dict[str, Any]] = {}
+    for key, value in observation.items():
+        if not isinstance(value, (Tensor, np.ndarray)):
+            continue
+        shape = tuple(value.shape[1:])
+        if key == OBS_IMAGE or key.startswith(f"{OBS_IMAGES}."):
+            if len(shape) != 3:
+                raise ValueError(f"Recording image {key!r} must be BCHW, got {tuple(value.shape)}.")
+            channels, height, width = shape
+            features[key] = {
+                "dtype": "video",
+                "shape": (height, width, channels),
+                "names": ["height", "width", "channel"],
+            }
+        elif key.startswith(f"{OBS_STR}."):
+            features[key] = {"dtype": "float32", "shape": shape, "names": None}
+
+    action_feature = env_features.get(ACTION)
+    if action_feature is None:
+        raise KeyError(f"Environment recording features must contain {ACTION!r}.")
+    action_shape = tuple(action_feature.shape)
+    features[ACTION] = {"dtype": "float32", "shape": action_shape, "names": None}
+    features["next.reward"] = {"dtype": "float32", "shape": (1,), "names": None}
+    features["next.success"] = {"dtype": "bool", "shape": (1,), "names": None}
+    features["next.done"] = {"dtype": "bool", "shape": (1,), "names": None}
+    return features
+
+
 def _build_raw_frame(
     raw_obs: dict,
     env_idx: int,
@@ -120,6 +161,7 @@ def _build_raw_frame(
     done: bool,
     task: str,
     env_features: dict,
+    processed_obs: dict[str, Any] | None = None,
 ) -> dict:
     """Build a dataset frame from raw env observations for one env index.
 
@@ -147,6 +189,26 @@ def _build_raw_frame(
             if val.dtype == np.float64:
                 val = val.astype(np.float32)
             frame[key] = val
+    if processed_obs is not None:
+        for key in env_features:
+            if key in frame or key == ACTION or key.startswith("next."):
+                continue
+            value = processed_obs.get(key)
+            if not isinstance(value, (Tensor, np.ndarray)):
+                continue
+            val = value[env_idx]
+            if isinstance(val, Tensor):
+                val = val.detach().to("cpu").numpy()
+            if key == OBS_IMAGE or key.startswith(f"{OBS_IMAGES}."):
+                # Fallback when a raw camera key does not map directly to the
+                # canonical policy image key.
+                val = np.moveaxis(val, 0, -1)
+                if np.issubdtype(val.dtype, np.floating):
+                    val = np.clip(np.rint(val * 255), 0, 255).astype(np.uint8)
+            elif val.dtype == np.float64:
+                val = val.astype(np.float32)
+            frame[key] = val
+
     frame[ACTION] = action
     frame["next.reward"] = np.atleast_1d(np.float32(reward))
     frame["next.success"] = np.atleast_1d(np.bool_(success))
@@ -214,27 +276,11 @@ def rollout(
         render_callback(env)
 
     recording_datasets: list[LeRobotDataset] | None = None
-    raw_observation = None
+    raw_observation = (
+        deepcopy(observation) if recording_dir is not None and env_features is not None else None
+    )
     task_desc = ""
     if recording_dir is not None and env_features is not None:
-        features = _env_features_to_dataset_features(env_features)
-        fps = env.unwrapped.metadata.get("render_fps", 30)
-        recording_datasets = []
-        multi_env = env.num_envs > 1
-        base_repo_id = recording_repo_id or "eval_recording"
-        for i in range(env.num_envs):
-            root = str(recording_dir / f"env_{i}") if multi_env else str(recording_dir)
-            repo_id = f"{base_repo_id}_env_{i}" if multi_env else base_repo_id
-            recording_datasets.append(
-                LeRobotDataset.create(
-                    repo_id=repo_id,
-                    fps=fps,
-                    features=features,
-                    root=root,
-                    use_videos=True,
-                )
-            )
-        raw_observation = deepcopy(observation)
         try:
             task_desc = list(env.call("task_description"))[0]
         except (AttributeError, NotImplementedError):
@@ -261,8 +307,6 @@ def rollout(
         while not np.all(done) and step < max_steps:
             # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
             observation = preprocess_observation(observation)
-            if return_observations:
-                all_observations.append(deepcopy(observation))
 
             # Infer "task" from sub-environments (prefer natural language description).
             # env.call() works with both SyncVectorEnv and AsyncVectorEnv.
@@ -276,6 +320,37 @@ def rollout(
 
             # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
             observation = env_preprocessor(observation)
+            recording_observation = observation
+
+            if recording_dir is not None and env_features is not None and recording_datasets is None:
+                features = _processed_observation_to_dataset_features(observation, env_features)
+                fps = env.unwrapped.metadata.get("render_fps", 30)
+                recording_datasets = []
+                multi_env = env.num_envs > 1
+                base_repo_id = recording_repo_id or "eval_recording"
+                for i in range(env.num_envs):
+                    root = recording_dir / f"env_{i}" if multi_env else recording_dir
+                    repo_id = f"{base_repo_id}_env_{i}" if multi_env else base_repo_id
+                    if (root / "meta" / "info.json").is_file():
+                        dataset = LeRobotDataset.resume(repo_id=repo_id, root=root)
+                    else:
+                        dataset = LeRobotDataset.create(
+                            repo_id=repo_id,
+                            fps=fps,
+                            features=features,
+                            root=root,
+                            use_videos=True,
+                        )
+                    recording_datasets.append(dataset)
+
+            if return_observations:
+                all_observations.append(
+                    {
+                        key: deepcopy(value)
+                        for key, value in observation.items()
+                        if isinstance(value, Tensor)
+                    }
+                )
 
             observation = preprocessor(observation)
             with torch.inference_mode():
@@ -327,6 +402,7 @@ def rollout(
             else:
                 successes = [False] * env.num_envs
 
+            reached_step_limit = step + 1 == max_steps
             if recording_datasets is not None and raw_observation is not None:
                 prev_done = done.copy()
                 for env_idx in range(env.num_envs):
@@ -338,12 +414,13 @@ def rollout(
                         action_numpy[env_idx],
                         reward[env_idx],
                         successes[env_idx],
-                        bool(terminated[env_idx] | truncated[env_idx]),
+                        bool(terminated[env_idx] | truncated[env_idx] | reached_step_limit),
                         task_desc,
                         recording_datasets[env_idx].features,
+                        recording_observation,
                     )
                     recording_datasets[env_idx].add_frame(frame)
-                    if terminated[env_idx] or truncated[env_idx]:
+                    if terminated[env_idx] or truncated[env_idx] or reached_step_limit:
                         recording_datasets[env_idx].save_episode()
                 raw_observation = deepcopy(observation)
 
@@ -352,7 +429,7 @@ def rollout(
             # This ensures that the rollout always terminates cleanly at `max_steps`,
             # and allows logging/saving (e.g., videos) to be triggered consistently.
             done = terminated | truncated | done
-            if step + 1 == max_steps:
+            if reached_step_limit:
                 done = np.ones_like(done, dtype=bool)
 
             all_actions.append(torch.from_numpy(action_numpy))
@@ -378,8 +455,14 @@ def rollout(
 
     # Track the final observation.
     if return_observations:
-        observation = preprocess_observation(observation)
-        all_observations.append(deepcopy(observation))
+        observation = env_preprocessor(preprocess_observation(observation))
+        all_observations.append(
+            {
+                key: deepcopy(value)
+                for key, value in observation.items()
+                if isinstance(value, Tensor)
+            }
+        )
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
     ret = {
