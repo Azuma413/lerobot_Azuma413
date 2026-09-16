@@ -56,6 +56,18 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     n_obs_steps: int = 1
     mic_num: int = 4
 
+    # --- 生波形エンコーダ (observation.audio) の設定 -------------------------
+    # wav2vec風のストライド付き1D convスタック。
+    # (out_channels, kernel_size, stride) を層ごとに指定する。
+    # 既定値は 16000 サンプル (1秒 @16kHz) を合計ストライド128で125フレームに落とす。
+    audio_conv_layers: tuple[tuple[int, int, int], ...] = (
+        (128, 16, 8),
+        (256, 8, 4),
+        (512, 4, 2),
+        (512, 4, 2),
+    )
+    audio_conv_norm_groups: int = 16
+
     input_features: dict[str, PolicyFeature] = field(default_factory=dict)
     output_features: dict[str, PolicyFeature] = field(default_factory=dict)
 
@@ -141,6 +153,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     @property
     def image_features(self) -> dict[str, PolicyFeature]:
         return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
+
+    @property
+    def audio_features(self) -> dict[str, PolicyFeature]:
+        """生波形入力 (num_mics, num_samples)。"""
+        return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.AUDIO}
 
     @property
     def action_feature(self) -> PolicyFeature | None:

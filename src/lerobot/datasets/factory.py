@@ -25,6 +25,7 @@ from lerobot.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
     MultiLeRobotDataset,
 )
+from lerobot.datasets.raw_audio_dataset import RawAudioLeRobotDataset, has_raw_audio
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
@@ -90,7 +91,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
-            dataset = LeRobotDataset(
+            # Datasets carrying per-episode raw audio need the variant that slices the
+            # waveform window out of the WAV files (see `raw_audio_dataset.py`).
+            dataset_cls = (
+                RawAudioLeRobotDataset if has_raw_audio(cfg.dataset.root) else LeRobotDataset
+            )
+            dataset = dataset_cls(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,

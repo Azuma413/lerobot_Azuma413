@@ -99,9 +99,14 @@ class ACTConfig(PreTrainedConfig):
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MEAN_STD,
+            "AUDIO": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
+
+    # 生波形エンコーダが transformer encoder に渡すトークン数。
+    # s2 設定の音関連トークン数 (mic backbone 7x7=49 + spec backbone 7x7=49) に揃えている。
+    audio_num_tokens: int = 98
 
     # Architecture.
     # Vision backbone.
@@ -170,8 +175,12 @@ class ACTConfig(PreTrainedConfig):
         return None
 
     def validate_features(self) -> None:
-        if not self.image_features and not self.env_state_feature:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if not self.image_features and not self.env_state_feature and not self.audio_features:
+            raise ValueError(
+                "You must provide at least one image, the environment state, or raw audio among the inputs."
+            )
+        if len(self.audio_features) > 1:
+            raise ValueError(f"At most one audio feature is supported. Got {list(self.audio_features)}.")
 
     @property
     def observation_delta_indices(self) -> None:

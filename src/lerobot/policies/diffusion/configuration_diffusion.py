@@ -112,9 +112,14 @@ class DiffusionConfig(PreTrainedConfig):
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MIN_MAX,
+            "AUDIO": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MIN_MAX,
         }
     )
+
+    # 生波形エンコーダが global_cond に足す特徴ベクトルの次元。
+    # s2 設定の音関連特徴長 (mic_encoder 64 + spec_encoder 64) に揃えている。
+    audio_feature_dim: int = 128
 
     # The original implementation doesn't sample frames for the last 7 steps,
     # which avoids excessive padding and leads to improved training results.
@@ -204,8 +209,12 @@ class DiffusionConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
-        if len(self.image_features) == 0 and self.env_state_feature is None:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if len(self.image_features) == 0 and self.env_state_feature is None and not self.audio_features:
+            raise ValueError(
+                "You must provide at least one image, the environment state, or raw audio among the inputs."
+            )
+        if len(self.audio_features) > 1:
+            raise ValueError(f"At most one audio feature is supported. Got {list(self.audio_features)}.")
 
         # Note: crop_shape is now used as the target size for Resize (not Crop),
         # so no constraint that crop_shape must be smaller than image_shape.

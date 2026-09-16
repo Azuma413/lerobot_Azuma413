@@ -201,6 +201,11 @@ def decode_video_frames_pyav(
     logging.getLogger("libav").setLevel(av.logging.ERROR)
     with av.open(video_path, "r") as container:
         stream = container.streams.video[0]
+        # Single-threaded decoding: the default (thread_count=0, auto) spawns a
+        # core-sized thread pool per open, which thrashes the CPU when many
+        # dataloader workers each open several camera videos per sample.
+        stream.codec_context.thread_type = "NONE"
+        stream.codec_context.thread_count = 1
         seek_ts = max(first_ts - tolerance_s, 0.0)
 
         try:

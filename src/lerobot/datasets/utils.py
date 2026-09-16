@@ -43,7 +43,7 @@ from lerobot.datasets.backward_compatibility import (
     BackwardCompatibilityError,
     ForwardCompatibilityError,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_AUDIO, OBS_ENV_STATE, OBS_STR
 from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
@@ -677,6 +677,9 @@ def build_dataset_frame(
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
+        elif ft["dtype"] == "float32" and key in values:
+            # 多次元の数値特徴（例: observation.audio の (num_mics, num_samples) 生波形）
+            frame[key] = np.asarray(values[key], dtype=np.float32)
 
     return frame
 
@@ -710,6 +713,9 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
             # Backward compatibility for "channel" which is an error introduced in LeRobotDataset v2.0 for ported datasets.
             if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
                 shape = (shape[2], shape[0], shape[1])
+        elif key == OBS_AUDIO or key.startswith(OBS_AUDIO + "."):
+            # 生波形 (num_channels, num_samples)
+            type = FeatureType.AUDIO
         elif key == OBS_ENV_STATE:
             type = FeatureType.ENV
         elif key.startswith(OBS_STR):

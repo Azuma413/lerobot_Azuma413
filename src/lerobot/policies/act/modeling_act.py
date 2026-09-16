@@ -35,6 +35,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.raw_audio_encoder import RawAudioConvStack, normalize_conv_layers
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 class ACTPolicy(PreTrainedPolicy):
@@ -394,6 +395,24 @@ class ACT(nn.Module):
                     self.backbone_output_dim, config.dim_model, kernel_size=1
                 )
 
+        # Raw waveform backbone (num_mics-ch 1D conv stack).
+        # The spectrogram image is replaced by the raw multichannel waveform, but the way the
+        # resulting features are fused (extra tokens for the transformer encoder) is unchanged.
+        self.audio_key = next(iter(self.config.audio_features), None)
+        if self.audio_key is not None:
+            num_mics = self.config.audio_features[self.audio_key].shape[0]
+            self.audio_backbone = RawAudioConvStack(
+                in_channels=num_mics,
+                layers=normalize_conv_layers(config.audio_conv_layers),
+                num_groups=config.audio_conv_norm_groups,
+            )
+            # s2設定の音関連トークン数に揃えるため、時間方向を固定長にプールする
+            self.audio_token_pool = nn.AdaptiveAvgPool1d(config.audio_num_tokens)
+            self.encoder_audio_feat_input_proj = nn.Conv1d(
+                self.audio_backbone.out_channels, config.dim_model, kernel_size=1
+            )
+            self.encoder_audio_feat_pos_embed = nn.Embedding(config.audio_num_tokens, config.dim_model)
+
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
@@ -458,7 +477,12 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        if OBS_IMAGES in batch:
+            batch_size = batch[OBS_IMAGES][0].shape[0]
+        elif self.audio_key is not None and self.audio_key in batch:
+            batch_size = batch[self.audio_key].shape[0]
+        else:
+            batch_size = batch[OBS_ENV_STATE].shape[0]
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -589,6 +613,17 @@ class ACT(nn.Module):
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+        # Raw waveform tokens. Same fusion as the image feature maps: the encoder output is
+        # projected to `dim_model` and appended to the transformer encoder's token sequence.
+        if self.audio_key is not None:
+            audio_features = self.audio_backbone(batch[self.audio_key])  # (B, C, T')
+            audio_features = self.audio_token_pool(audio_features)  # (B, C, n_tokens)
+            audio_features = self.encoder_audio_feat_input_proj(audio_features)  # (B, D, n_tokens)
+            audio_features = einops.rearrange(audio_features, "b c t -> t b c")
+            audio_pos_embed = self.encoder_audio_feat_pos_embed.weight.unsqueeze(1)  # (n_tokens, 1, D)
+            encoder_in_tokens.extend(list(audio_features))
+            encoder_in_pos_embed.extend(list(audio_pos_embed))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)

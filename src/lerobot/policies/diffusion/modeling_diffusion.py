@@ -35,6 +35,7 @@ from torch import Tensor, nn
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.raw_audio_encoder import RawAudioConvStack, normalize_conv_layers
 from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
@@ -87,6 +88,8 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
         for key in self.config.image_features:
+            self._queues[key] = deque(maxlen=self.config.n_obs_steps)
+        for key in self.config.audio_features:
             self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
@@ -200,6 +203,14 @@ class DiffusionModel(nn.Module):
 
             self.rgb_encoder = nn.ModuleDict(encoders)
             global_cond_dim += global_cond_dim_images
+
+        # Raw waveform encoder. The spectrogram image is replaced by the raw multichannel
+        # waveform, but the fusion is unchanged: a fixed-size feature vector concatenated
+        # into the global conditioning of the UNet.
+        self.audio_key = next(iter(self.config.audio_features), None)
+        if self.audio_key is not None:
+            self.audio_encoder = DiffusionRawAudioEncoder(config, self.audio_key)
+            global_cond_dim += self.audio_encoder.feature_dim
 
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
@@ -334,6 +345,13 @@ class DiffusionModel(nn.Module):
                 img_features = torch.cat(img_features_list, dim=-1)
                 global_cond_feats.append(img_features)
 
+        if self.audio_key is not None:
+            # (B, S, num_mics, num_samples) -> (B*S, num_mics, num_samples)
+            wav = einops.rearrange(batch[self.audio_key], "b s ... -> (b s) ...")
+            audio_feats = self.audio_encoder(wav)
+            audio_feats = einops.rearrange(audio_feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+            global_cond_feats.append(audio_feats)
+
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
@@ -383,7 +401,11 @@ class DiffusionModel(nn.Module):
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
-        assert any(key in batch for key in self.config.image_features) or OBS_ENV_STATE in batch
+        assert (
+            any(key in batch for key in self.config.image_features)
+            or any(key in batch for key in self.config.audio_features)
+            or OBS_ENV_STATE in batch
+        )
         n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon
@@ -502,6 +524,33 @@ class SpatialSoftmax(nn.Module):
         feature_keypoints = expected_xy.view(-1, self._out_c, 2)
 
         return feature_keypoints
+
+
+class DiffusionRawAudioEncoder(nn.Module):
+    """Encodes a multichannel raw waveform into a 1D feature vector.
+
+    Mirrors `DiffusionRgbEncoder`'s role (backbone -> pooling -> linear -> ReLU) so that the
+    global-conditioning fusion is identical; only the backbone is a 1D conv stack.
+    """
+
+    def __init__(self, config: DiffusionConfig, audio_key: str):
+        super().__init__()
+        num_mics = config.audio_features[audio_key].shape[0]
+        self.backbone = RawAudioConvStack(
+            in_channels=num_mics,
+            layers=normalize_conv_layers(config.audio_conv_layers),
+            num_groups=config.audio_conv_norm_groups,
+        )
+        self.feature_dim = config.audio_feature_dim
+        # 平均と最大の両方を取ることで、定常的なスペクトルと過渡的なイベントの双方を拾う
+        self.out = nn.Linear(self.backbone.out_channels * 2, self.feature_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        """(B, num_mics, num_samples) -> (B, feature_dim)."""
+        feat = self.backbone(x)
+        pooled = torch.cat([feat.mean(dim=-1), feat.amax(dim=-1)], dim=-1)
+        return self.relu(self.out(pooled))
 
 
 class DiffusionRgbEncoder(nn.Module):
