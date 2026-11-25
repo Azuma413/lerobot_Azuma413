@@ -81,7 +81,7 @@ class DatasetConfig:
 class WandBConfig:
     enable: bool = False
     # Set to true to disable saving an artifact despite training.save_checkpoint=True
-    disable_artifact: bool = False
+    disable_artifact: bool = True  # GripPolicy: wandb にモデルを送らない (2026-11-06 user 指示)
     project: str = "lerobot"
     entity: str | None = None
     notes: str | None = None
